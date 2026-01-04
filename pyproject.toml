@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CBBmix"
+version = "0.1.0"
+description = "A 3-component Beta-Binomial mixture model for clustering clonal structure of somatic variants"
+readme = "README"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Danilo Tatoni"}
+]
+keywords = ["statistics", "mixture-model", "bioinformatics", "cancer-genomics"]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/danilotat/BBclonalcluster"
+Repository = "https://github.com/danilotat/BBclonalcluster"
+Issues = "https://github.com/danilotat/BBclonalcluster/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
+select = ["E", "F", "W", "I"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov --cov-report=html --cov-report=term"
