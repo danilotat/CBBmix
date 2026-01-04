@@ -4,6 +4,7 @@ from scipy.optimize import minimize_scalar
 from .utils import beta_binom_logpmf, smart_init_parameters, ab_from_mu_kappa
 from .params import BetaBinomialMixtureSpec
 
+
 def fit_robust_3_component_smart(
     alt,
     depth,
@@ -38,9 +39,8 @@ def fit_robust_3_component_smart(
             log_resps = np.zeros((N, 3))
             for k in range(3):
                 a, b = ab_from_mu_kappa(mu[k], kappa[k])
-                log_resps[:, k] = (
-                    np.log(pi[k] + 1e-10)
-                    + beta_binom_logpmf(alt, depth, a, b)
+                log_resps[:, k] = np.log(pi[k] + 1e-10) + beta_binom_logpmf(
+                    alt, depth, a, b
                 )
 
             log_norm = logsumexp(log_resps, axis=1)
@@ -96,5 +96,3 @@ def fit_robust_3_component_smart(
             best_fit = result
 
     return best_fit
-
-

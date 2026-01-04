@@ -2,9 +2,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
-_DEFAULT_MU_BOUNDS = np.array(
-    [[0, .25], [.35, .65],[.85, 1]])
-_DEFAULT_KAPPA_BOUNDS = (5, 5000) 
+_DEFAULT_MU_BOUNDS = np.array([[0, 0.25], [0.35, 0.65], [0.85, 1]])
+_DEFAULT_KAPPA_BOUNDS = (5, 5000)
 _DEFAULT_KAPPA_INIT = np.array([50.0, 100.0, 50.0])
 _DEFAULT_PI_INIT = np.array([0.33, 0.34, 0.33])
 _DEFAULT_WEIGHT_PRIOR = 1.5
