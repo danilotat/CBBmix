@@ -1,4 +1,4 @@
-import cyvcf2.VCF as VCF
+from cyvcf2 import VCF
 import numpy as np
 from collections import defaultdict
 

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from germline_estimator import (
+from CBBmix.germline import (
     GermlineEstimator,
     fit_germline,
     fit_germline_from_combined,

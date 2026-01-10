@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 from unittest.mock import Mock, patch, PropertyMock
 
-from germline_variant_collector import (
+from CBBmix.vcf import (
     ChromosomeArmLookup,
     GermlineVariantCollector,
     _CHROMOSOME_ARMS,

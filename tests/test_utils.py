@@ -4,7 +4,6 @@ from scipy.stats import betabinom
 
 from CBBmix.utils import beta_binom_logpmf, ab_from_mu_kappa, smart_init_parameters
 
-
 class TestBetaBinomLogpmf:
     """Tests for beta_binom_logpmf function."""
 

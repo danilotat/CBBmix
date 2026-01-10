@@ -1,12 +1,11 @@
 import numpy as np
 import pytest
-
-from somatic_mixture import (
+from CBBmix.somatic import (
     SomaticMixture,
     fit_somatic_mixture,
     fit_arm,
 )
-from utils import (
+from CBBmix.utils import (
     SomaticPrior,
     SomaticMixtureSpec,
     GermlineFitResult,
