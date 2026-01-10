@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.stats import betabinom
 
-from CBBmix.utils import beta_binom_logpmf, ab_from_mu_kappa, smart_init_parameters
+from CBBmix.utils import beta_binom_logpmf, ab_from_mu_kappa, smart_init_somatic
 
 class TestBetaBinomLogpmf:
     """Tests for beta_binom_logpmf function."""
@@ -123,7 +123,7 @@ class TestSmartInitParameters:
         depth = np.full_like(alt, 100.0)
         bounds_mu = np.array([[0, 0.25], [0.35, 0.65], [0.85, 1.0]])
 
-        result = smart_init_parameters(alt, depth, bounds_mu)
+        result = smart_init_somatic(alt, depth, bounds_mu)
 
         assert result.shape == (3,)
         assert result[0] < result[1] < result[2]  # Ordered
@@ -138,7 +138,7 @@ class TestSmartInitParameters:
         depth = np.array([100, 100, 100, 100])
         bounds_mu = np.array([[0, 0.25], [0.35, 0.65], [0.85, 1.0]])
 
-        result = smart_init_parameters(alt, depth, bounds_mu)
+        result = smart_init_somatic(alt, depth, bounds_mu)
 
         # Subclonal should use bounds mean
         assert result[0] == np.mean(bounds_mu[0])
@@ -153,7 +153,7 @@ class TestSmartInitParameters:
         depth = np.full(30, 100.0)
         bounds_mu = np.array([[0.05, 0.25], [0.35, 0.65], [0.85, 0.95]])
 
-        result = smart_init_parameters(alt, depth, bounds_mu)
+        result = smart_init_somatic(alt, depth, bounds_mu)
 
         for i in range(3):
             assert bounds_mu[i, 0] <= result[i] <= bounds_mu[i, 1]
@@ -165,7 +165,7 @@ class TestSmartInitParameters:
         depth = np.full(7, 100.0)
         bounds_mu = np.array([[0, 0.25], [0.35, 0.65], [0.85, 1.0]])
 
-        result = smart_init_parameters(alt, depth, bounds_mu)
+        result = smart_init_somatic(alt, depth, bounds_mu)
 
         vaf = alt / depth
         mask_cl = (vaf >= 0.35) & (vaf <= 0.65)
@@ -179,7 +179,7 @@ class TestSmartInitParameters:
         depth = np.array([0, 100, 100])
         bounds_mu = np.array([[0, 0.25], [0.35, 0.65], [0.85, 1.0]])
 
-        result = smart_init_parameters(alt, depth, bounds_mu)
+        result = smart_init_somatic(alt, depth, bounds_mu)
 
         assert result.shape == (3,)
         assert np.all(np.isfinite(result))
@@ -190,7 +190,7 @@ class TestSmartInitParameters:
         depth = np.array([100, 100, 100])
         bounds_mu = np.array([[0, 0.25], [0.35, 0.65], [0.85, 1.0]])
 
-        result = smart_init_parameters(alt, depth, bounds_mu)
+        result = smart_init_somatic(alt, depth, bounds_mu)
 
         assert isinstance(result, np.ndarray)
         assert result.dtype == np.float64
@@ -207,7 +207,7 @@ class TestIntegration:
         bounds_mu = np.array([[0, 0.25], [0.35, 0.65], [0.85, 1.0]])
 
         # Initialize
-        mu_init = smart_init_parameters(alt, depth, bounds_mu)
+        mu_init = smart_init_somatic(alt, depth, bounds_mu)
 
         # Convert and calculate
         for k in range(3):
