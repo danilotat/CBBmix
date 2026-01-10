@@ -4,19 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CBBmix"
-version = "0.1.0"
+version = "0.2.0"
 description = "A 3-component Beta-Binomial mixture model for clustering clonal structure of somatic variants"
-readme = "README"
+readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "Danilo Tatoni"}
 ]
-keywords = ["statistics", "mixture-model", "bioinformatics", "cancer-genomics"]
+keywords = ["statistics", "mixture-model", "bioinformatics", "cancer-genomics", "vcf", "somatic-variants"]
 
 dependencies = [
     "numpy>=1.20.0",
     "scipy>=1.7.0",
+    "cyvcf2>=0.30.0",
 ]
 
 [project.optional-dependencies]
@@ -28,9 +29,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/danilotat/BBclonalcluster"
-Repository = "https://github.com/danilotat/BBclonalcluster"
-Issues = "https://github.com/danilotat/BBclonalcluster/issues"
+Homepage = "https://github.com/danilotat/CBBmix"
+Repository = "https://github.com/danilotat/CBBmix"
+Issues = "https://github.com/danilotat/CBBmix/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
