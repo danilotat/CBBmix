@@ -462,9 +462,7 @@ class SomaticMixture:
         for k, name in enumerate(self.COMPONENT_NAMES):
             mask = self.responsibilities.argmax(axis=1) == k
             n_assigned = mask.sum()
-            mean_resp = (
-                self.responsibilities[:, k].mean() if self.n_variants > 0 else 0
-            )
+            mean_resp = self.responsibilities[:, k].mean() if self.n_variants > 0 else 0
 
             summary[name] = {
                 "mu": self.mu[k],

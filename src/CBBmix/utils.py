@@ -149,7 +149,7 @@ class GermlineSpec:
     mu_het_expected: float = 0.5
 
     # Bounds for mu estimation
-    mu_het_bounds: tuple[float, float] = (0.10, 0.90) 
+    mu_het_bounds: tuple[float, float] = (0.10, 0.90)
     mu_hom_bounds: tuple[float, float] = (0.85, 0.9999)
 
     # Bounds for kappa
@@ -183,15 +183,11 @@ class SomaticMixtureSpec:
     bounds_kappa: tuple[float, float] = (5.0, 500.0)
 
     # Default values (used when no germline prior available)
-    mu_default: np.ndarray = field(
-        default_factory=lambda: np.array([0.15, 0.50, 0.85])
-    )
+    mu_default: np.ndarray = field(default_factory=lambda: np.array([0.15, 0.50, 0.85]))
     kappa_default: np.ndarray = field(
         default_factory=lambda: np.array([50.0, 50.0, 50.0])
     )
-    pi_default: np.ndarray = field(
-        default_factory=lambda: np.array([0.25, 0.50, 0.25])
-    )
+    pi_default: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.50, 0.25]))
 
     # Default Dirichlet prior on mixing proportions
     pi_prior_default: np.ndarray = field(
@@ -213,6 +209,7 @@ class SomaticMixtureSpec:
         self.pi_default = np.asarray(self.pi_default)
         self.pi_prior_default = np.asarray(self.pi_prior_default)
         self.mu_prior_sigma_default = np.asarray(self.mu_prior_sigma_default)
+
 
 @dataclass
 class GermlineFitResult:
