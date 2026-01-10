@@ -108,10 +108,11 @@ class GermlineVariantCollector:
         self._chrs_arms_lookup = ChromosomeArmLookup(_CHROMOSOME_ARMS)
         self.vcf_file = VCF(vcf)
         self._common_germ_af = .05
-        self.germline_vars = self._collect_germline_vars() 
         self._csq_keys = [
             j.strip() for j in self.vcf_file.get_header_type('CSQ')['Description'].replace('"','').split('Format: ')[1].split('|')
         ] 
+        self.germline_vars = self._collect_germline_vars() 
+        
 
     @staticmethod
     def read_genotypes(genotype: list):
