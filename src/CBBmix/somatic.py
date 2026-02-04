@@ -1,612 +1,668 @@
 """
-Somatic 3-component Beta-Binomial mixture model with germline-informed priors.
+Somatic Pitman-Yor Process mixture model for clustering somatic variants.
 
-This module fits a mixture model to somatic variants using MAP-EM,
-where priors are derived from germline estimation on the same chromosome arm.
+This module implements a Bayesian nonparametric mixture model to cluster
+somatic variants by their Cellular Prevalence (CP). The model integrates
+germline-estimated parameters (delta, kappa, psi) to account for:
+- Reference bias (delta)
+- Overdispersion (kappa)
+- Segment-level allelic imbalance (psi)
 
-Components:
-    0: Subclonal - low VAF variants (VAF ~ 0.05-0.25)
-    1: Clonal - variants at expected tumor VAF (VAF ~ 0.3-0.6)
-    2: LOH/Amplified - high VAF due to copy number changes (VAF ~ 0.6-0.99)
+The Pitman-Yor Process provides a flexible prior over cluster assignments,
+allowing for power-law behavior in cluster sizes.
 
-The germline provides:
-    - κ_het → technical dispersion for all components
-    - μ_het → baseline allelic balance (deviation indicates LOH)
-    - LOH signal → adjusts component priors
+Model specification (see CLAUDE.md for full mathematical details):
+- Cluster weights via truncated stick-breaking
+- Cellular Prevalence (rho_k) per cluster
+- Per-variant haplotype assignment (h_i) and ASE noise (sigma_i)
+- Beta-Binomial observation model
 """
 
 import numpy as np
-from scipy.special import logsumexp
-from scipy.optimize import minimize_scalar
-from typing import Optional
+import pandas as pd
+import jax
+import jax.numpy as jnp
+import numpyro
+import numpyro.distributions as dist
+from numpyro.infer import MCMC, NUTS
+from numpyro.handlers import seed, trace
+import logging
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
 
-from .utils import (
-    beta_binom_logpmf,
-    ab_from_mu_kappa,
-    smart_init_somatic,
-    SomaticMixtureSpec,
-    SomaticPrior,
-    SomaticFitResult,
-    GermlineFitResult,
-    build_somatic_prior_from_germline,
-    build_default_somatic_prior,
-)
+from germline import GermlineModel
+from vcf import SomaticVariantCollector
+
+jax.config.update("jax_enable_x64", True)
 
 
-class SomaticMixture:
+MAX_KAPPA = 200.0
+
+
+@dataclass
+class SomaticPriorConfig:
+    """Configuration for somatic model priors.
+
+    Attributes:
+        alpha_py: Pitman-Yor concentration parameter (controls cluster count)
+        theta_py: Pitman-Yor discount parameter (controls power-law behavior)
+        max_clusters: Truncation level K for stick-breaking
+        sigma_scale: Scale for per-variant ASE noise (default 0.1)
+        rho_alpha: Beta prior alpha for Cellular Prevalence (default 1.0)
+        rho_beta: Beta prior beta for Cellular Prevalence (default 1.0)
+        max_kappa: Maximum allowed kappa from germline (default 200.0)
     """
-    3-component Beta-Binomial mixture model for somatic variants.
+    alpha_py: float = 1.0
+    theta_py: float = 0.1
+    max_clusters: int = 10
+    sigma_scale: float = 0.1
+    rho_alpha: float = 1.0
+    rho_beta: float = 1.0
+    max_kappa: float = MAX_KAPPA
 
-    Uses MAP-EM (Maximum A Posteriori Expectation-Maximization)
-    with priors derived from germline estimation on the same arm.
 
-    Components:
-        0 (SUBCLONAL): Low VAF variants
-        1 (CLONAL): Variants at expected tumor VAF
-        2 (LOH): High VAF due to loss of heterozygosity
+class SomaticModel:
+    """
+    Pitman-Yor Process mixture model for clustering somatic variants.
+
+    This model clusters somatic variants based on their Cellular Prevalence (CP),
+    integrating germline-estimated parameters to correct for reference bias,
+    overdispersion, and segment-level allelic imbalance.
+
+    The model accounts for unknown haplotype phasing by introducing a latent
+    variable h_i for each variant, representing whether the mutation is on
+    the major or minor allele.
 
     Parameters
     ----------
-    chrom : str
-        Chromosome identifier.
-    arm : str
-        Chromosome arm ('p' or 'q').
-    prior : SomaticPrior, optional
-        Prior derived from germline. If None, uses defaults.
-    spec : SomaticMixtureSpec, optional
-        Model specification for bounds.
-
-    Attributes
-    ----------
-    mu : np.ndarray
-        Fitted mean VAF for each component.
-    kappa : np.ndarray
-        Fitted precision for each component.
-    pi : np.ndarray
-        Fitted mixing proportions.
-    responsibilities : np.ndarray
-        Posterior component probabilities (N x 3).
+    somatic_collector_data : SomaticVariantCollector
+        Collected somatic variants from VCF
+    germline_model : GermlineModel
+        Fitted germline model with posterior samples
+    prior_config : SomaticPriorConfig, optional
+        Configuration for model priors
+    min_dp_cutoff : int
+        Minimum depth filter for variants (default 10)
+    use_germline_samples : bool
+        If True, sample from germline posterior during inference.
+        If False, use point estimates (posterior means).
     """
-
-    SUBCLONAL: int = 0
-    CLONAL: int = 1
-    LOH: int = 2
-    COMPONENT_NAMES = ("subclonal", "clonal", "loh")
 
     def __init__(
         self,
-        chrom: str,
-        arm: str,
-        prior: Optional[SomaticPrior] = None,
-        spec: Optional[SomaticMixtureSpec] = None,
+        somatic_collector_data: SomaticVariantCollector,
+        germline_model: GermlineModel,
+        prior_config: Optional[SomaticPriorConfig] = None,
+        min_dp_cutoff: int = 10,
+        use_germline_samples: bool = False,
     ):
-        self.chrom = chrom
-        self.arm = arm
-        self.spec = spec if spec is not None else SomaticMixtureSpec()
+        self.raw_data = somatic_collector_data
+        self.germline_model = germline_model
+        self.germline_results = germline_model.arm_results
+        self.prior_config = prior_config or SomaticPriorConfig()
+        self._min_dp_cutoff = min_dp_cutoff
+        self._use_germline_samples = use_germline_samples
 
-        # Set prior
-        if prior is not None:
-            self.prior = prior
-        else:
-            self.prior = build_default_somatic_prior(chrom, arm, self.spec)
+        # Preprocess data to link variants with arm-level germline parameters
+        self.data_df = self._preprocess_data()
 
-        # Parameters (set after fitting)
-        self.mu: Optional[np.ndarray] = None
-        self.kappa: Optional[np.ndarray] = None
-        self.pi: Optional[np.ndarray] = None
-        self.responsibilities: Optional[np.ndarray] = None
+        # Store inference results
+        self.mcmc = None
+        self.samples = None
+        self.clustering_results = None
 
-        # Diagnostics
-        self.loglik: float = -np.inf
-        self.bic: float = np.inf
-        self.converged: bool = False
-        self.n_iterations: int = 0
-        self.n_variants: int = 0
-
-        # Store data
-        self._alt: Optional[np.ndarray] = None
-        self._depth: Optional[np.ndarray] = None
-
-    @classmethod
-    def from_germline(
-        cls,
-        chrom: str,
-        arm: str,
-        germline_result: GermlineFitResult,
-        tumor_purity: float = 1.0,
-        spec: Optional[SomaticMixtureSpec] = None,
-    ) -> "SomaticMixture":
+    def _preprocess_data(self) -> pd.DataFrame:
         """
-        Create SomaticMixture with prior derived from germline fit.
+        Extract somatic variants and map them to germline arm-level parameters.
 
-        This is the recommended constructor when germline data is available.
-
-        Parameters
-        ----------
-        chrom : str
-            Chromosome identifier.
-        arm : str
-            Chromosome arm.
-        germline_result : GermlineFitResult
-            Germline fit results.
-        tumor_purity : float
-            Estimated tumor purity (0, 1].
-        spec : SomaticMixtureSpec, optional
-            Model specification.
-
-        Returns
-        -------
-        SomaticMixture
-            Model with germline-informed prior.
+        Returns DataFrame with columns:
+        - chrom, arm: chromosome arm identifier
+        - depth, alt_count, vaf: variant read data
+        - arm_delta, arm_kappa, arm_psi: germline parameters for this arm
         """
-        prior = build_somatic_prior_from_germline(germline_result, tumor_purity, spec)
-        return cls(chrom, arm, prior, spec)
+        records = []
+
+        for chrom, arms in self.raw_data.somatic_vars.items():
+            for arm in arms:
+                try:
+                    arm_data = self.raw_data.somatic_vars[chrom][arm]
+                    dps = arm_data['DP']
+                    alt_dps = arm_data['alt_DP']
+                    vafs = arm_data['VAF']
+
+                    arm_key = f"{chrom}{arm}"
+
+                    # Retrieve germline posteriors for this arm
+                    if arm_key in self.germline_results:
+                        arm_stats = self.germline_results[arm_key]
+                        g_delta = arm_stats.get('delta_mean', 0.0)
+                        g_kappa = arm_stats.get('kappa_mean', 10.0)
+                        g_psi = arm_stats.get('psi_mean', 0.0)
+                    else:
+                        logging.warning(
+                            f"Arm {arm_key} not found in germline results. "
+                            "Using diploid defaults."
+                        )
+                        g_delta = 0.0
+                        g_kappa = 10.0
+                        g_psi = 0.0
+
+                    # Cap kappa to prevent numerical issues
+                    g_kappa = min(g_kappa, self.prior_config.max_kappa)
+
+                    for d, ad, v in zip(dps, alt_dps, vafs):
+                        records.append({
+                            'chrom': chrom,
+                            'arm': arm,
+                            'arm_key': arm_key,
+                            'depth': int(d),
+                            'alt_count': int(ad),
+                            'vaf': float(v),
+                            'arm_delta': float(g_delta),
+                            'arm_kappa': float(g_kappa),
+                            'arm_psi': float(g_psi),
+                        })
+                except Exception as e:
+                    logging.debug(f"No somatic variants for {chrom}{arm}: {e}")
+
+        df = pd.DataFrame(records)
+        if not df.empty:
+            df = df[df['depth'] >= self._min_dp_cutoff]
+
+        return df
+
+    def _pitman_yor_model(
+        self,
+        depth: jnp.ndarray,
+        alt_count: jnp.ndarray,
+        arm_delta: jnp.ndarray,
+        arm_kappa: jnp.ndarray,
+        arm_psi: jnp.ndarray,
+    ):
+        """
+        Numpyro model for Pitman-Yor Process somatic variant clustering.
+
+        Model Structure (see CLAUDE.md):
+
+        Global Priors:
+            (alpha_PY, theta_PY) - Fixed hyperparameters
+            Omega_germ ~ P_germline (Empirical Posterior)
+
+        Cluster Parameters (k=1...K):
+            nu_k ~ Beta(1-theta, alpha + k*theta)
+            rho_k ~ Beta(rho_alpha, rho_beta)
+
+        Local Variant Latents (i=1...N):
+            z_i ~ Categorical(w)
+            sigma_i ~ Normal(0, sigma_scale)
+            h_i ~ Bernoulli(0.5)
+
+        Deterministic Link:
+            mu_i = rho_{z_i} * logit^{-1}(-delta + sigma_i + (2*h_i - 1)*psi_{s_i})
+
+        Observation:
+            d_alt,i ~ BetaBinom(d_i, mu_i, kappa)
+        """
+        config = self.prior_config
+        K = config.max_clusters
+        n_variants = depth.shape[0]
+
+        # ============================================
+        # 1. Pitman-Yor Stick-Breaking Construction
+        # ============================================
+        # nu_k ~ Beta(1 - theta, alpha + k*theta) for k=1,...,K-1
+        # nu_K = 1 (to ensure weights sum to 1)
+
+        with numpyro.plate("sticks", K - 1):
+            k_indices = jnp.arange(1, K)  # k = 1, 2, ..., K-1
+            nu = numpyro.sample(
+                "nu",
+                dist.Beta(
+                    1.0 - config.theta_py,
+                    config.alpha_py + k_indices * config.theta_py
+                )
+            )
+
+        # Append nu_K = 1 for truncation
+        nu_full = jnp.concatenate([nu, jnp.array([1.0])])
+
+        # Compute mixing weights via stick-breaking
+        # w_k = nu_k * prod_{j<k}(1 - nu_j)
+        one_minus_nu = 1.0 - nu_full
+        cumprod_one_minus_nu = jnp.concatenate([
+            jnp.array([1.0]),
+            jnp.cumprod(one_minus_nu[:-1])
+        ])
+        weights = nu_full * cumprod_one_minus_nu
+        weights = numpyro.deterministic("weights", weights)
+
+        # ============================================
+        # 2. Cluster-Level Parameters: Cellular Prevalence
+        # ============================================
+        with numpyro.plate("clusters", K):
+            rho = numpyro.sample(
+                "rho",
+                dist.Beta(config.rho_alpha, config.rho_beta)
+            )
+
+        # ============================================
+        # 3. Variant-Level Latent Variables
+        # ============================================
+        with numpyro.plate("variants", n_variants):
+            # Cluster assignment
+            z = numpyro.sample("z", dist.Categorical(weights))
+
+            # Per-variant ASE noise
+            sigma = numpyro.sample(
+                "sigma",
+                dist.Normal(0.0, config.sigma_scale)
+            )
+
+            # Haplotype assignment (0 = minor allele, 1 = major allele)
+            h = numpyro.sample("h", dist.Bernoulli(0.5))
+
+        # ============================================
+        # 4. Compute Expected VAF
+        # ============================================
+        # Get cellular prevalence for each variant's assigned cluster
+        rho_i = rho[z]
+
+        # Compute allelic proportions based on haplotype
+        # eta_base = -delta + sigma
+        # If h=1 (major): eta = eta_base + psi
+        # If h=0 (minor): eta = eta_base - psi
+        eta_base = -arm_delta + sigma
+
+        # (2*h - 1) maps h=0 -> -1, h=1 -> +1
+        haplotype_sign = 2.0 * h - 1.0
+        eta = eta_base + haplotype_sign * arm_psi
+
+        # Allelic proportion via inverse logit
+        pi = jax.nn.sigmoid(eta)
+
+        # Expected somatic VAF = CP * allelic proportion
+        mu = rho_i * pi
+
+        # Numerical stability
+        mu = jnp.clip(mu, 1e-6, 1.0 - 1e-6)
+
+        # ============================================
+        # 5. Observation Model: Beta-Binomial
+        # ============================================
+        # Parameterization: alpha = mu*(kappa-1), beta = (1-mu)*(kappa-1)
+        conc = arm_kappa - 1.0
+        conc = jnp.maximum(conc, 1e-6)  # Ensure positive
+
+        with numpyro.plate("obs", n_variants):
+            numpyro.sample(
+                "y",
+                dist.BetaBinomial(
+                    concentration1=mu * conc,
+                    concentration0=(1.0 - mu) * conc,
+                    total_count=depth
+                ),
+                obs=alt_count
+            )
+
+    def _pitman_yor_model_marginalized(
+        self,
+        depth: jnp.ndarray,
+        alt_count: jnp.ndarray,
+        arm_delta: jnp.ndarray,
+        arm_kappa: jnp.ndarray,
+        arm_psi: jnp.ndarray,
+    ):
+        """
+        Marginalized version of the PYP model for more efficient inference.
+
+        This version marginalizes out the discrete latent variables (z, h)
+        analytically, which can improve MCMC mixing.
+        """
+        config = self.prior_config
+        K = config.max_clusters
+        n_variants = depth.shape[0]
+
+        # ============================================
+        # 1. Pitman-Yor Stick-Breaking
+        # ============================================
+        with numpyro.plate("sticks", K - 1):
+            k_indices = jnp.arange(1, K)
+            nu = numpyro.sample(
+                "nu",
+                dist.Beta(
+                    1.0 - config.theta_py,
+                    config.alpha_py + k_indices * config.theta_py
+                )
+            )
+
+        nu_full = jnp.concatenate([nu, jnp.array([1.0])])
+        one_minus_nu = 1.0 - nu_full
+        cumprod_one_minus_nu = jnp.concatenate([
+            jnp.array([1.0]),
+            jnp.cumprod(one_minus_nu[:-1])
+        ])
+        weights = nu_full * cumprod_one_minus_nu
+        weights = numpyro.deterministic("weights", weights)
+        log_weights = jnp.log(weights + 1e-10)
+
+        # ============================================
+        # 2. Cluster Cellular Prevalences
+        # ============================================
+        with numpyro.plate("clusters", K):
+            rho = numpyro.sample(
+                "rho",
+                dist.Beta(config.rho_alpha, config.rho_beta)
+            )
+
+        # ============================================
+        # 3. Per-Variant ASE Noise
+        # ============================================
+        with numpyro.plate("variants", n_variants):
+            sigma = numpyro.sample(
+                "sigma",
+                dist.Normal(0.0, config.sigma_scale)
+            )
+
+        # ============================================
+        # 4. Compute Likelihoods (Marginalized)
+        # ============================================
+        # Expand dimensions for broadcasting: (N, K, 2) for variants x clusters x haplotypes
+
+        # Shape: (N, 1)
+        delta_exp = arm_delta[:, None]
+        psi_exp = arm_psi[:, None]
+        kappa_exp = arm_kappa[:, None]
+        sigma_exp = sigma[:, None]
+        depth_exp = depth[:, None]
+        alt_exp = alt_count[:, None]
+
+        # Shape: (1, K)
+        rho_exp = rho[None, :]
+
+        # Compute eta for both haplotypes
+        eta_base = -delta_exp + sigma_exp  # (N, 1)
+
+        # Major allele (h=1): eta_base + psi
+        eta_major = eta_base + psi_exp  # (N, 1)
+        # Minor allele (h=0): eta_base - psi
+        eta_minor = eta_base - psi_exp  # (N, 1)
+
+        # Allelic proportions
+        pi_major = jax.nn.sigmoid(eta_major)  # (N, 1)
+        pi_minor = jax.nn.sigmoid(eta_minor)  # (N, 1)
+
+        # Expected VAF for each cluster and haplotype
+        # mu = rho * pi, shape: (N, K)
+        mu_major = rho_exp * pi_major
+        mu_minor = rho_exp * pi_minor
+
+        # Clip for stability
+        mu_major = jnp.clip(mu_major, 1e-6, 1.0 - 1e-6)
+        mu_minor = jnp.clip(mu_minor, 1e-6, 1.0 - 1e-6)
+
+        # Concentration parameter
+        conc = jnp.maximum(kappa_exp - 1.0, 1e-6)  # (N, 1)
+
+        # Log-likelihoods for each cluster and haplotype
+        # Shape: (N, K)
+        log_prob_major = dist.BetaBinomial(
+            concentration1=mu_major * conc,
+            concentration0=(1.0 - mu_major) * conc,
+            total_count=depth_exp
+        ).log_prob(alt_exp)
+
+        log_prob_minor = dist.BetaBinomial(
+            concentration1=mu_minor * conc,
+            concentration0=(1.0 - mu_minor) * conc,
+            total_count=depth_exp
+        ).log_prob(alt_exp)
+
+        # Marginalize over haplotype: log(0.5 * exp(major) + 0.5 * exp(minor))
+        # = log(0.5) + logsumexp(major, minor)
+        log_prob_cluster = jnp.log(0.5) + jnp.logaddexp(
+            log_prob_major, log_prob_minor
+        )  # (N, K)
+
+        # Marginalize over clusters: log(sum_k w_k * p(y|k))
+        # = logsumexp(log_w_k + log_p(y|k))
+        log_mixture_prob = jax.scipy.special.logsumexp(
+            log_weights + log_prob_cluster, axis=-1
+        )  # (N,)
+
+        # Factor the total log-likelihood
+        numpyro.factor("obs", log_mixture_prob.sum())
 
     def fit(
         self,
-        alt: np.ndarray,
-        depth: np.ndarray,
-        max_iter: int = 500,
-        tol: float = 1e-6,
-        n_restarts: int = 3,
-        random_state: int = 42,
-    ) -> "SomaticMixture":
+        num_warmup: int = 500,
+        num_samples: int = 1000,
+        num_chains: int = 1,
+        seed: int = 42,
+        use_marginalized: bool = True,
+    ) -> None:
         """
-        Fit the 3-component mixture using MAP-EM.
+        Fit the somatic clustering model using MCMC.
 
         Parameters
         ----------
-        alt : np.ndarray
-            Alt allele read counts.
-        depth : np.ndarray
-            Total read depth.
-        max_iter : int
-            Maximum EM iterations per restart.
-        tol : float
-            Convergence tolerance for log-likelihood.
-        n_restarts : int
-            Number of random restarts.
-        random_state : int
-            Random seed.
+        num_warmup : int
+            Number of warmup/burn-in iterations
+        num_samples : int
+            Number of posterior samples to draw
+        num_chains : int
+            Number of MCMC chains
+        seed : int
+            Random seed for reproducibility
+        use_marginalized : bool
+            If True, use marginalized model (more efficient).
+            If False, use full model with discrete latent variables.
+        """
+        if self.data_df.empty:
+            logging.warning("No somatic variants after filtering. Skipping fit.")
+            return
+
+        n_variants = len(self.data_df)
+        logging.info(f"Fitting somatic model on {n_variants} variants...")
+        logging.info(f"Max clusters: {self.prior_config.max_clusters}")
+
+        # Prepare JAX arrays
+        depth = jnp.array(self.data_df['depth'].values)
+        alt_count = jnp.array(self.data_df['alt_count'].values)
+        arm_delta = jnp.array(self.data_df['arm_delta'].values)
+        arm_kappa = jnp.array(self.data_df['arm_kappa'].values)
+        arm_psi = jnp.array(self.data_df['arm_psi'].values)
+
+        # Select model
+        model_fn = (
+            self._pitman_yor_model_marginalized
+            if use_marginalized
+            else self._pitman_yor_model
+        )
+
+        # Run MCMC
+        kernel = NUTS(model_fn)
+        self.mcmc = MCMC(
+            kernel,
+            num_warmup=num_warmup,
+            num_samples=num_samples,
+            num_chains=num_chains,
+            progress_bar=True,
+        )
+
+        self.mcmc.run(
+            jax.random.PRNGKey(seed),
+            depth,
+            alt_count,
+            arm_delta,
+            arm_kappa,
+            arm_psi,
+        )
+
+        self.samples = self.mcmc.get_samples()
+        self._summarize_results()
+
+        logging.info("Somatic model fitting complete.")
+
+    def _summarize_results(self) -> None:
+        """Summarize posterior to identify major clonal populations."""
+        if self.samples is None:
+            return
+
+        # Compute posterior mean weights
+        weights_samples = self.samples['weights']  # (n_samples, K)
+        rho_samples = self.samples['rho']  # (n_samples, K)
+
+        mean_weights = jnp.mean(weights_samples, axis=0)
+        mean_rho = jnp.mean(rho_samples, axis=0)
+        std_rho = jnp.std(rho_samples, axis=0)
+
+        # Build summary for clusters with weight > 5%
+        summary_records = []
+        for k in range(self.prior_config.max_clusters):
+            if mean_weights[k] > 0.05:
+                summary_records.append({
+                    'cluster_id': k,
+                    'weight': float(mean_weights[k]),
+                    'rho_mean': float(mean_rho[k]),
+                    'rho_std': float(std_rho[k]),
+                })
+
+        self.clustering_results = pd.DataFrame(summary_records)
+        if not self.clustering_results.empty:
+            self.clustering_results = self.clustering_results.sort_values(
+                'rho_mean', ascending=False
+            )
+
+        print("\n--- Identified Somatic Clones (Cellular Prevalence) ---")
+        print(self.clustering_results.to_string(index=False))
+
+    def get_cluster_assignments(self) -> Optional[np.ndarray]:
+        """
+        Compute posterior cluster assignments for each variant.
 
         Returns
         -------
-        SomaticMixture
-            Self, for method chaining.
+        assignments : np.ndarray of shape (n_variants,)
+            Most likely cluster assignment for each variant, or None if not fitted.
         """
-        alt = np.asarray(alt, dtype=float)
-        depth = np.asarray(depth, dtype=float)
-        self._alt = alt
-        self._depth = depth
-        self.n_variants = len(alt)
+        if self.samples is None:
+            logging.warning("Model not fitted. Call fit() first.")
+            return None
 
-        # Edge cases
-        if self.n_variants == 0:
-            self._set_empty_fit()
-            return self
-
-        if self.n_variants < 3:
-            self._set_prior_fit()
-            return self
-
-        rng = np.random.default_rng(random_state)
-        best_result = None
-
-        for restart in range(n_restarts):
-            result = self._fit_single_restart(alt, depth, max_iter, tol, rng, restart)
-
-            if best_result is None or result["loglik"] > best_result["loglik"]:
-                best_result = result
-
-        # Store best
-        self.mu = best_result["mu"]
-        self.kappa = best_result["kappa"]
-        self.pi = best_result["pi"]
-        self.responsibilities = best_result["responsibilities"]
-        self.loglik = best_result["loglik"]
-        self.bic = best_result["bic"]
-        self.converged = best_result["converged"]
-        self.n_iterations = best_result["n_iterations"]
-
-        return self
-
-    def _fit_single_restart(
-        self,
-        alt: np.ndarray,
-        depth: np.ndarray,
-        max_iter: int,
-        tol: float,
-        rng: np.random.Generator,
-        restart: int,
-    ) -> dict:
-        """Single MAP-EM optimization run."""
-        N = len(alt)
-        spec = self.spec
-        prior = self.prior
-
-        # Initialize
-        if restart == 0:
-            mu = smart_init_somatic(alt, depth, spec.bounds_mu)
-            mu = 0.5 * mu + 0.5 * prior.mu_prior_mean
+        if 'z' in self.samples:
+            # Mode of discrete z samples
+            z_samples = self.samples['z']  # (n_samples, n_variants)
+            z_mode = jax.scipy.stats.mode(z_samples, axis=0).mode
+            return np.array(z_mode)
         else:
-            mu = prior.mu_prior_mean + rng.uniform(-0.08, 0.08, 3)
+            # For marginalized model, compute assignment probabilities
+            logging.info("Computing cluster assignments from marginalized model...")
+            return self._compute_assignments_marginalized()
 
-        mu = np.clip(mu, spec.bounds_mu[:, 0], spec.bounds_mu[:, 1])
-        kappa = prior.kappa_prior_mean.copy()
-        pi = prior.pi_prior / prior.pi_prior.sum()
+    def _compute_assignments_marginalized(self) -> np.ndarray:
+        """Compute cluster assignments from marginalized model posteriors."""
+        depth = jnp.array(self.data_df['depth'].values)
+        alt_count = jnp.array(self.data_df['alt_count'].values)
+        arm_delta = jnp.array(self.data_df['arm_delta'].values)
+        arm_kappa = jnp.array(self.data_df['arm_kappa'].values)
+        arm_psi = jnp.array(self.data_df['arm_psi'].values)
 
-        if restart > 0:
-            kappa = np.clip(
-                kappa * rng.uniform(0.7, 1.3, 3),
-                spec.bounds_kappa[0],
-                spec.bounds_kappa[1],
-            )
+        # Use posterior means
+        weights = jnp.mean(self.samples['weights'], axis=0)
+        rho = jnp.mean(self.samples['rho'], axis=0)
+        sigma = jnp.mean(self.samples['sigma'], axis=0)
 
-        prev_ll = -np.inf
-        converged = False
+        K = self.prior_config.max_clusters
+        n_variants = len(depth)
 
-        for iteration in range(max_iter):
-            # =================================================================
-            # E-step
-            # =================================================================
-            log_resps = np.zeros((N, 3))
-            for k in range(3):
-                a, b = ab_from_mu_kappa(mu[k], kappa[k])
-                log_resps[:, k] = np.log(pi[k] + 1e-10) + beta_binom_logpmf(
-                    alt, depth, a, b
-                )
+        # Compute log-posteriors for each cluster
+        log_weights = jnp.log(weights + 1e-10)
 
-            log_norm = logsumexp(log_resps, axis=1)
-            resps = np.exp(log_resps - log_norm[:, None])
-            ll = log_norm.sum()
+        # Expand dims
+        delta_exp = arm_delta[:, None]
+        psi_exp = arm_psi[:, None]
+        kappa_exp = arm_kappa[:, None]
+        sigma_exp = sigma[:, None]
+        depth_exp = depth[:, None]
+        alt_exp = alt_count[:, None]
+        rho_exp = rho[None, :]
 
-            if abs(ll - prev_ll) < tol:
-                converged = True
-                break
-            prev_ll = ll
+        eta_base = -delta_exp + sigma_exp
+        eta_major = eta_base + psi_exp
+        eta_minor = eta_base - psi_exp
 
-            # =================================================================
-            # M-step (MAP)
-            # =================================================================
+        pi_major = jax.nn.sigmoid(eta_major)
+        pi_minor = jax.nn.sigmoid(eta_minor)
 
-            # Mixing proportions: Dirichlet posterior
-            eff_counts = resps.sum(axis=0) + prior.pi_prior
-            pi = eff_counts / eff_counts.sum()
+        mu_major = jnp.clip(rho_exp * pi_major, 1e-6, 1.0 - 1e-6)
+        mu_minor = jnp.clip(rho_exp * pi_minor, 1e-6, 1.0 - 1e-6)
 
-            # Component parameters
-            for k in range(3):
-                # --- mu: Gaussian prior ---
-                def neg_posterior_mu(m):
-                    a, b = ab_from_mu_kappa(m, kappa[k])
-                    ll_data = np.sum(resps[:, k] * beta_binom_logpmf(alt, depth, a, b))
-                    ll_prior = (
-                        -0.5
-                        * ((m - prior.mu_prior_mean[k]) / prior.mu_prior_sigma[k]) ** 2
-                    )
-                    return -(ll_data + ll_prior)
+        conc = jnp.maximum(kappa_exp - 1.0, 1e-6)
 
-                mu[k] = minimize_scalar(
-                    neg_posterior_mu,
-                    bounds=spec.bounds_mu[k],
-                    method="bounded",
-                ).x
+        log_prob_major = dist.BetaBinomial(
+            concentration1=mu_major * conc,
+            concentration0=(1.0 - mu_major) * conc,
+            total_count=depth_exp
+        ).log_prob(alt_exp)
 
-                # --- kappa: log-normal prior ---
-                def neg_posterior_kappa(kv):
-                    a, b = ab_from_mu_kappa(mu[k], kv)
-                    ll_data = np.sum(resps[:, k] * beta_binom_logpmf(alt, depth, a, b))
-                    ll_prior = (
-                        -0.5
-                        * (
-                            (np.log(kv) - np.log(prior.kappa_prior_mean[k]))
-                            / prior.kappa_prior_log_sigma
-                        )
-                        ** 2
-                    )
-                    return -(ll_data + ll_prior)
+        log_prob_minor = dist.BetaBinomial(
+            concentration1=mu_minor * conc,
+            concentration0=(1.0 - mu_minor) * conc,
+            total_count=depth_exp
+        ).log_prob(alt_exp)
 
-                kappa[k] = minimize_scalar(
-                    neg_posterior_kappa,
-                    bounds=spec.bounds_kappa,
-                    method="bounded",
-                ).x
+        log_prob_cluster = jnp.log(0.5) + jnp.logaddexp(
+            log_prob_major, log_prob_minor
+        )
 
-        # BIC
-        n_params = 3 + 3 + 2  # mu + kappa + pi (simplex)
-        bic = -2 * ll + n_params * np.log(N)
+        # Posterior cluster probabilities (unnormalized log)
+        log_posterior = log_weights + log_prob_cluster
 
-        return {
-            "mu": mu,
-            "kappa": kappa,
-            "pi": pi,
-            "responsibilities": resps,
-            "loglik": ll,
-            "bic": bic,
-            "converged": converged,
-            "n_iterations": iteration + 1,
-        }
+        # Argmax for MAP assignment
+        assignments = jnp.argmax(log_posterior, axis=-1)
 
-    def _set_empty_fit(self):
-        """Set parameters for empty input."""
-        self.mu = self.prior.mu_prior_mean.copy()
-        self.kappa = self.prior.kappa_prior_mean.copy()
-        self.pi = self.prior.pi_prior / self.prior.pi_prior.sum()
-        self.responsibilities = np.array([]).reshape(0, 3)
-        self.loglik = 0.0
-        self.bic = 0.0
-        self.converged = True
-        self.n_iterations = 0
+        return np.array(assignments)
 
-    def _set_prior_fit(self):
-        """Set parameters for very small N."""
-        self.mu = self.prior.mu_prior_mean.copy()
-        self.kappa = self.prior.kappa_prior_mean.copy()
-        self.pi = self.prior.pi_prior / self.prior.pi_prior.sum()
-
-        if self._alt is not None and len(self._alt) > 0:
-            self.responsibilities = self.predict_proba(self._alt, self._depth)
+    def print_summary(self) -> None:
+        """Print MCMC summary statistics."""
+        if self.mcmc is not None:
+            self.mcmc.print_summary()
         else:
-            self.responsibilities = np.array([]).reshape(0, 3)
-
-        self.loglik = -np.inf
-        self.bic = np.inf
-        self.converged = True
-        self.n_iterations = 0
-
-    def get_result(self) -> SomaticFitResult:
-        """
-        Package results into SomaticFitResult.
-
-        Returns
-        -------
-        SomaticFitResult
-            Structured results.
-        """
-        if self.mu is None:
-            raise ValueError("Must call fit() before get_result()")
-
-        return SomaticFitResult(
-            chrom=self.chrom,
-            arm=self.arm,
-            mu=self.mu.copy(),
-            kappa=self.kappa.copy(),
-            pi=self.pi.copy(),
-            n_variants=self.n_variants,
-            loglik=self.loglik,
-            bic=self.bic,
-            converged=self.converged,
-            n_iterations=self.n_iterations,
-            responsibilities=self.responsibilities.copy(),
-            prior=self.prior,
-        )
-
-    def predict_proba(self, alt: np.ndarray, depth: np.ndarray) -> np.ndarray:
-        """
-        Compute component probabilities for data.
-
-        Parameters
-        ----------
-        alt : np.ndarray
-            Alt counts.
-        depth : np.ndarray
-            Total depth.
-
-        Returns
-        -------
-        np.ndarray
-            Responsibilities (N x 3).
-        """
-        if self.mu is None:
-            raise ValueError("Must fit before prediction")
-
-        alt = np.asarray(alt, dtype=float)
-        depth = np.asarray(depth, dtype=float)
-        N = len(alt)
-
-        if N == 0:
-            return np.array([]).reshape(0, 3)
-
-        log_resps = np.zeros((N, 3))
-        for k in range(3):
-            a, b = ab_from_mu_kappa(self.mu[k], self.kappa[k])
-            log_resps[:, k] = np.log(self.pi[k] + 1e-10) + beta_binom_logpmf(
-                alt, depth, a, b
-            )
-
-        log_norm = logsumexp(log_resps, axis=1)
-        return np.exp(log_resps - log_norm[:, None])
-
-    def predict(
-        self, alt: np.ndarray, depth: np.ndarray, threshold: float = 0.0
-    ) -> np.ndarray:
-        """
-        Predict component labels.
-
-        Parameters
-        ----------
-        alt : np.ndarray
-            Alt counts.
-        depth : np.ndarray
-            Total depth.
-        threshold : float
-            Min responsibility for assignment (-1 if below).
-
-        Returns
-        -------
-        np.ndarray
-            Component indices (0, 1, 2) or -1.
-        """
-        proba = self.predict_proba(alt, depth)
-        if len(proba) == 0:
-            return np.array([], dtype=int)
-
-        assignments = proba.argmax(axis=1).astype(int)
-        if threshold > 0:
-            assignments[proba.max(axis=1) < threshold] = -1
-
-        return assignments
-
-    def get_component_summary(self) -> dict:
-        """
-        Summary statistics per component.
-
-        Returns
-        -------
-        dict
-            Per-component statistics.
-        """
-        if self.responsibilities is None:
-            raise ValueError("Must fit first")
-
-        summary = {}
-        for k, name in enumerate(self.COMPONENT_NAMES):
-            mask = self.responsibilities.argmax(axis=1) == k
-            n_assigned = mask.sum()
-            mean_resp = (
-                self.responsibilities[:, k].mean() if self.n_variants > 0 else 0
-            )
-
-            summary[name] = {
-                "mu": self.mu[k],
-                "kappa": self.kappa[k],
-                "pi": self.pi[k],
-                "n_assigned": int(n_assigned),
-                "mean_responsibility": mean_resp,
-            }
-
-        return summary
-
-    def __repr__(self) -> str:
-        status = "fitted" if self.mu is not None else "not fitted"
-        return (
-            f"SomaticMixture(chrom={self.chrom!r}, arm={self.arm!r}, "
-            f"n_variants={self.n_variants}, prior={self.prior.source}, "
-            f"status={status})"
-        )
+            logging.warning("Model not fitted. Call fit() first.")
 
 
-# =============================================================================
-# Convenience Functions
-# =============================================================================
+if __name__ == '__main__':
+    from vcf import GermlineVariantCollector, SomaticVariantCollector
 
+    # Example usage
+    vcf_path = "/Users/danilo/Research/Tools/CBBmix/data/vcf/ipiPD1_26_PRE_final_passonly.vcf.gz"
 
-def fit_somatic_mixture(
-    chrom: str,
-    arm: str,
-    alt: np.ndarray,
-    depth: np.ndarray,
-    germline_result: Optional[GermlineFitResult] = None,
-    tumor_purity: float = 1.0,
-    spec: Optional[SomaticMixtureSpec] = None,
-    **kwargs,
-) -> SomaticFitResult:
-    """
-    Convenience function to fit somatic mixture.
+    # 1. Collect variants
+    germ_collector = GermlineVariantCollector(vcf_path, af_thresholds=[0.25, 0.75])
+    som_collector = SomaticVariantCollector(vcf_path)
 
-    Parameters
-    ----------
-    chrom : str
-        Chromosome.
-    arm : str
-        Chromosome arm.
-    alt : np.ndarray
-        Alt counts.
-    depth : np.ndarray
-        Total depth.
-    germline_result : GermlineFitResult, optional
-        Germline fit for prior construction.
-    tumor_purity : float
-        Tumor purity estimate.
-    spec : SomaticMixtureSpec, optional
-        Model specification.
-    **kwargs
-        Passed to fit().
+    # 2. Fit germline model
+    germ_model = GermlineModel(germ_collector)
+    germ_model.fit(num_warmup=200, num_samples=500)
 
-    Returns
-    -------
-    SomaticFitResult
-        Fit results.
-    """
-    if germline_result is not None:
-        model = SomaticMixture.from_germline(
-            chrom, arm, germline_result, tumor_purity, spec
-        )
-    else:
-        model = SomaticMixture(chrom, arm, None, spec)
-
-    model.fit(alt, depth, **kwargs)
-    return model.get_result()
-
-
-def fit_arm(
-    chrom: str,
-    arm: str,
-    germline_het_alt: np.ndarray,
-    germline_het_depth: np.ndarray,
-    somatic_alt: np.ndarray,
-    somatic_depth: np.ndarray,
-    germline_hom_alt: np.ndarray | None = None,
-    germline_hom_depth: np.ndarray | None = None,
-    tumor_purity: float = 1.0,
-    min_germline_het: int = 5,
-) -> dict:
-    """
-    Complete pipeline: germline estimation → prior → somatic mixture.
-
-    Parameters
-    ----------
-    chrom : str
-        Chromosome.
-    arm : str
-        Chromosome arm.
-    germline_het_alt : np.ndarray
-        Germline het alt counts.
-    germline_het_depth : np.ndarray
-        Germline het depths.
-    somatic_alt : np.ndarray
-        Somatic alt counts.
-    somatic_depth : np.ndarray
-        Somatic depths.
-    germline_hom_alt : np.ndarray, optional
-        Germline hom ALT alt counts.
-    germline_hom_depth : np.ndarray, optional
-        Germline hom ALT depths.
-    tumor_purity : float
-        Tumor purity.
-    min_germline_het : int
-        Min het variants to use germline prior.
-
-    Returns
-    -------
-    dict
-        Contains 'germline', 'somatic', 'prior_source'.
-    """
-    from .germline import fit_germline
-
-    # Stage 1: Germline estimation
-    germline_result = None
-    if len(germline_het_alt) >= min_germline_het:
-        germline_result = fit_germline(
-            chrom=chrom,
-            arm=arm,
-            het_alt=germline_het_alt,
-            het_depth=germline_het_depth,
-            hom_alt=germline_hom_alt,
-            hom_depth=germline_hom_depth,
-        )
-
-    # Stage 2: Somatic mixture
-    somatic_result = fit_somatic_mixture(
-        chrom=chrom,
-        arm=arm,
-        alt=somatic_alt,
-        depth=somatic_depth,
-        germline_result=germline_result,
-        tumor_purity=tumor_purity,
+    # 3. Fit somatic model with germline priors
+    prior_config = SomaticPriorConfig(
+        alpha_py=1.0,
+        theta_py=0.1,
+        max_clusters=10,
+        sigma_scale=0.1,
     )
 
-    return {
-        "germline": germline_result,
-        "somatic": somatic_result,
-        "prior_source": "germline" if germline_result is not None else "default",
-    }
+    som_model = SomaticModel(
+        som_collector,
+        germ_model,
+        prior_config=prior_config,
+    )
+
+    som_model.fit(num_warmup=200, num_samples=500)
+    som_model.print_summary()
+
+    # Get cluster assignments
+    assignments = som_model.get_cluster_assignments()
+    if assignments is not None:
+        print(f"\nCluster assignments: {np.unique(assignments, return_counts=True)}")
