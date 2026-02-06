@@ -1,64 +1,51 @@
 """
-Beta-Binomial Mixture Models for Somatic Variant Analysis.
-...
+CBBmix: 3-component Beta-Binomial mixture model for clonal structure analysis.
+
+This package provides Bayesian inference tools for analyzing somatic variants
+in cancer genomics data from RNA-seq.
+
+Main components:
+- GermlineModel: Estimates per-arm allelic imbalance (delta, kappa, psi)
+- SomaticModel: Pitman-Yor process clustering by Cellular Prevalence
+- GermlineVariantCollector / SomaticVariantCollector: VCF parsing utilities
+
+Example usage:
+    from CBBmix import (
+        GermlineVariantCollector,
+        SomaticVariantCollector,
+        GermlineModel,
+        SomaticModel,
+        SomaticPriorConfig,
+    )
+
+    # Collect variants
+    germ_collector = GermlineVariantCollector("sample.vcf.gz")
+    som_collector = SomaticVariantCollector("sample.vcf.gz")
+
+    # Fit germline model
+    germ_model = GermlineModel(germ_collector)
+    germ_model.fit()
+
+    # Fit somatic model with germline priors
+    som_model = SomaticModel(som_collector, germ_model)
+    som_model.fit()
 """
 
-from .utils import (
-    # Distribution functions
-    beta_binom_logpmf,
-    ab_from_mu_kappa,
-    fit_beta_binomial_mle,
-    # Data classes
-    GermlineSpec,
-    SomaticMixtureSpec,
-    GermlineFitResult,
-    SomaticFitResult,
-    SomaticPrior,
-    # Prior construction
-    build_somatic_prior_from_germline,
-    build_default_somatic_prior,
-)
-
-from .germline import (
-    GermlineEstimator,
-    fit_germline,
-    fit_germline_from_combined,
-)
-
-from .somatic import (
-    SomaticMixture,
-    fit_somatic_mixture,
-    fit_arm,
-)
-
 from .vcf import (
-    ChromosomeArmLookup,
     GermlineVariantCollector,
+    SomaticVariantCollector,
+    ChromosomeArmLookup,
 )
+from .germline import GermlineModel
+from .somatic import SomaticModel, SomaticPriorConfig
+
+__version__ = "0.1.0"
 
 __all__ = [
-    # Classes
-    "GermlineEstimator",
-    "SomaticMixture",
-    "ChromosomeArmLookup",
     "GermlineVariantCollector",
-    # Convenience functions
-    "fit_germline",
-    "fit_germline_from_combined",
-    "fit_somatic_mixture",
-    "fit_arm",
-    # Data classes
-    "GermlineSpec",
-    "SomaticMixtureSpec",
-    "GermlineFitResult",
-    "SomaticFitResult",
-    "SomaticPrior",
-    # Utilities
-    "beta_binom_logpmf",
-    "ab_from_mu_kappa",
-    "fit_beta_binomial_mle",
-    "build_somatic_prior_from_germline",
-    "build_default_somatic_prior",
+    "SomaticVariantCollector",
+    "ChromosomeArmLookup",
+    "GermlineModel",
+    "SomaticModel",
+    "SomaticPriorConfig",
 ]
-
-__version__ = "0.2.0"
