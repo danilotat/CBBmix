@@ -1,7 +1,8 @@
 /*
  * _baf.cpp — High-performance BAF computation from BAM via htslib pileup.
  *
- * Returns (positions, bafs) as NumPy arrays for a given chromosome region.
+ * Returns (positions, total_depth, alt_depth) as NumPy arrays for a given
+ * chromosome region.
  */
 
 #include <pybind11/pybind11.h>
@@ -86,7 +87,8 @@ static py::tuple compute_baf(const std::string &bam_path,
                              int min_mapq    = 20,
                              int min_baseq   = 20,
                              float min_baf   = 0.2f,
-                             float max_baf   = 0.7f) {
+                             float max_baf   = 0.7f,
+                             int min_alt     = 2) {
     // Open BAM
     HtsFilePtr fp(sam_open(bam_path.c_str(), "r"));
     if (!fp) throw std::runtime_error("Cannot open BAM: " + bam_path);
@@ -118,7 +120,8 @@ static py::tuple compute_baf(const std::string &bam_path,
 
     // Result vectors
     std::vector<int32_t> positions;
-    std::vector<float>   bafs;
+    std::vector<int32_t> total_depths;
+    std::vector<int32_t> alt_depths;
 
     int tid, pos, n;
     const bam_pileup1_t *pile;
@@ -170,10 +173,12 @@ static py::tuple compute_baf(const std::string &bam_path,
             }
         }
 
+        if (max_alt < min_alt) continue;
         float baf = static_cast<float>(max_alt) / static_cast<float>(valid);
         if (baf >= min_baf && baf <= max_baf) {
             positions.push_back(pos);
-            bafs.push_back(baf);
+            total_depths.push_back(valid);
+            alt_depths.push_back(max_alt);
         }
     }
 
@@ -183,10 +188,12 @@ static py::tuple compute_baf(const std::string &bam_path,
     // Convert to NumPy arrays
     py::array_t<int32_t> pos_arr(static_cast<py::ssize_t>(positions.size()),
                                   positions.data());
-    py::array_t<float>   baf_arr(static_cast<py::ssize_t>(bafs.size()),
-                                  bafs.data());
+    py::array_t<int32_t> td_arr(static_cast<py::ssize_t>(total_depths.size()),
+                                 total_depths.data());
+    py::array_t<int32_t> ad_arr(static_cast<py::ssize_t>(alt_depths.size()),
+                                 alt_depths.data());
 
-    return py::make_tuple(pos_arr, baf_arr);
+    return py::make_tuple(pos_arr, td_arr, ad_arr);
 }
 
 // ─── Pybind11 module ────────────────────────────────────────────────────────
@@ -204,6 +211,7 @@ PYBIND11_MODULE(_baf, m) {
           py::arg("min_baseq")  = 20,
           py::arg("min_baf")    = 0.2f,
           py::arg("max_baf")    = 0.7f,
+          py::arg("min_alt")    = 2,
           R"doc(
 Compute B-Allele Frequencies from a BAM file for a genomic region.
 
@@ -222,13 +230,15 @@ min_mapq : int
 min_baseq : int
     Minimum base quality (default: 20).
 min_baf : float
-    Minimum BAF to report (default: 0.1).
+    Minimum BAF to report (default: 0.2).
 max_baf : float
-    Maximum BAF to report (default: 1.0).
+    Maximum BAF to report (default: 0.7).
+min_alt : int
+    Minimum alt allele read count to report (default: 2).
 
 Returns
 -------
-tuple[np.ndarray, np.ndarray]
-    (positions, bafs) — int32 positions and float32 BAF values.
+tuple[np.ndarray, np.ndarray, np.ndarray]
+    (positions, total_depth, alt_depth) — int32 arrays.
 )doc");
 }

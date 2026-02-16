@@ -27,7 +27,8 @@ def compute_baf(
     min_baseq: int = 20,
     min_baf: float = 0.2,
     max_baf: float = 0.7,
-) -> Tuple[np.ndarray, np.ndarray]:
+    min_alt: int = 2,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute B-Allele Frequencies from a BAM file for a genomic region.
 
     Parameters
@@ -48,11 +49,13 @@ def compute_baf(
         Minimum BAF threshold to report (default: 0.2).
     max_baf : float
         Maximum BAF threshold to report (default: 0.7).
+    min_alt : int
+        Minimum alt allele read count to report (default: 2).
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray]
-        ``(positions, bafs)`` — int32 genomic positions and float32 BAF values.
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+        ``(positions, total_depth, alt_depth)`` — int32 arrays.
 
     Raises
     ------
@@ -65,7 +68,8 @@ def compute_baf(
             "pip install -e ."
         )
     return _compute_baf(
-        bam_path, ref_path, region, min_depth, min_mapq, min_baseq, min_baf, max_baf
+        bam_path, ref_path, region, min_depth, min_mapq, min_baseq, min_baf, max_baf,
+        min_alt,
     )
 
 
@@ -81,7 +85,8 @@ def compute_baf_genome(
     min_baseq: int = 20,
     min_baf: float = 0.2,
     max_baf: float = 0.7,
-) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    min_alt: int = 2,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Compute BAF across all chromosomes (or a subset).
 
     Parameters
@@ -102,19 +107,22 @@ def compute_baf_genome(
         Minimum BAF to report (default: 0.2).
     max_baf : float
         Maximum BAF to report (default: 0.7).
+    min_alt : int
+        Minimum alt allele read count to report (default: 2).
 
     Returns
     -------
-    dict[str, tuple[np.ndarray, np.ndarray]]
-        Mapping of chromosome name to ``(positions, bafs)``.
+    dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]
+        Mapping of chromosome name to ``(positions, total_depth, alt_depth)``.
     """
     if chromosomes is None:
         chromosomes = CHROMOSOMES
 
     results = {}
     for chrom in chromosomes:
-        positions, bafs = compute_baf(
-            bam_path, ref_path, chrom, min_depth, min_mapq, min_baseq, min_baf, max_baf
+        positions, total_depth, alt_depth = compute_baf(
+            bam_path, ref_path, chrom, min_depth, min_mapq, min_baseq, min_baf,
+            max_baf, min_alt,
         )
-        results[chrom] = (positions, bafs)
+        results[chrom] = (positions, total_depth, alt_depth)
     return results
