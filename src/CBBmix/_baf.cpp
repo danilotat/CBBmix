@@ -176,6 +176,9 @@ static py::tuple compute_baf(const std::string &bam_path,
         }
     }
 
+    // Reacquire GIL before creating Python objects (call_guard released it)
+    py::gil_scoped_acquire acquire;
+
     // Convert to NumPy arrays
     py::array_t<int32_t> pos_arr(static_cast<py::ssize_t>(positions.size()),
                                   positions.data());
