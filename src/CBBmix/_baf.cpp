@@ -85,7 +85,8 @@ static py::tuple compute_baf(const std::string &bam_path,
                              int min_depth   = 10,
                              int min_mapq    = 20,
                              int min_baseq   = 20,
-                             float min_baf   = 0.1f) {
+                             float min_baf   = 0.1f,
+                             float max_baf   = 1.0f) {
     // Open BAM
     HtsFilePtr fp(sam_open(bam_path.c_str(), "r"));
     if (!fp) throw std::runtime_error("Cannot open BAM: " + bam_path);
@@ -170,7 +171,7 @@ static py::tuple compute_baf(const std::string &bam_path,
         }
 
         float baf = static_cast<float>(max_alt) / static_cast<float>(valid);
-        if (baf >= min_baf) {
+        if (baf >= min_baf && baf <= max_baf) {
             positions.push_back(pos);
             bafs.push_back(baf);
         }
@@ -202,6 +203,7 @@ PYBIND11_MODULE(_baf, m) {
           py::arg("min_mapq")   = 20,
           py::arg("min_baseq")  = 20,
           py::arg("min_baf")    = 0.1f,
+          py::arg("max_baf")    = 1.0f,
           R"doc(
 Compute B-Allele Frequencies from a BAM file for a genomic region.
 
@@ -221,6 +223,8 @@ min_baseq : int
     Minimum base quality (default: 20).
 min_baf : float
     Minimum BAF to report (default: 0.1).
+max_baf : float
+    Maximum BAF to report (default: 1.0).
 
 Returns
 -------

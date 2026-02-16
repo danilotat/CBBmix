@@ -25,7 +25,8 @@ def compute_baf(
     min_depth: int = 10,
     min_mapq: int = 20,
     min_baseq: int = 20,
-    min_baf: float = 0.1,
+    min_baf: float = 0.2,
+    max_baf: float = 0.7,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute B-Allele Frequencies from a BAM file for a genomic region.
 
@@ -44,7 +45,9 @@ def compute_baf(
     min_baseq : int
         Minimum base quality filter (default: 20).
     min_baf : float
-        Minimum BAF threshold to report (default: 0.1).
+        Minimum BAF threshold to report (default: 0.2).
+    max_baf : float
+        Maximum BAF threshold to report (default: 0.7).
 
     Returns
     -------
@@ -62,7 +65,7 @@ def compute_baf(
             "pip install -e ."
         )
     return _compute_baf(
-        bam_path, ref_path, region, min_depth, min_mapq, min_baseq, min_baf
+        bam_path, ref_path, region, min_depth, min_mapq, min_baseq, min_baf, max_baf
     )
 
 
@@ -76,7 +79,8 @@ def compute_baf_genome(
     min_depth: int = 10,
     min_mapq: int = 20,
     min_baseq: int = 20,
-    min_baf: float = 0.1,
+    min_baf: float = 0.2,
+    max_baf: float = 0.7,
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """Compute BAF across all chromosomes (or a subset).
 
@@ -95,7 +99,9 @@ def compute_baf_genome(
     min_baseq : int
         Minimum base quality (default: 20).
     min_baf : float
-        Minimum BAF to report (default: 0.1).
+        Minimum BAF to report (default: 0.2).
+    max_baf : float
+        Maximum BAF to report (default: 0.7).
 
     Returns
     -------
@@ -108,7 +114,7 @@ def compute_baf_genome(
     results = {}
     for chrom in chromosomes:
         positions, bafs = compute_baf(
-            bam_path, ref_path, chrom, min_depth, min_mapq, min_baseq, min_baf
+            bam_path, ref_path, chrom, min_depth, min_mapq, min_baseq, min_baf, max_baf
         )
         results[chrom] = (positions, bafs)
     return results
