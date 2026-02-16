@@ -1,149 +1,296 @@
 import numpy as np
+import jax
+import jax.numpy as jnp
 import pytest
+from unittest.mock import Mock, patch
 
 from CBBmix.germline import (
-    GermlineEstimator,
-    fit_germline,
-    fit_germline_from_combined,
+    GermlineModel,
+    SegmentedGermlineModel,
+    germline_segmented_model,
 )
+from CBBmix.utils import compute_scaled_distances
 
 
-class TestGermlineEstimator:
-    """Minimal tests for GermlineEstimator."""
+class TestGermlineModel:
+    """Tests for the arm-level GermlineModel."""
 
-    def test_fit_basic(self):
-        """Test basic fitting with synthetic data."""
-        # Simulate het variants around VAF=0.5
+    @pytest.fixture
+    def mock_collector(self):
+        """Create a mock GermlineVariantCollector."""
+        collector = Mock()
+        collector.germline_vars = {
+            'chr1': {
+                'p': {
+                    'hetalt': {
+                        'DP': [50, 60, 70, 80, 90] * 10,
+                        'alt_DP': [25, 28, 33, 42, 48] * 10,
+                        'VAF': [0.5, 0.47, 0.47, 0.525, 0.53] * 10,
+                        'POS': list(range(1000000, 1000000 + 50 * 100000, 100000)),
+                    }
+                },
+                'q': {
+                    'hetalt': {
+                        'DP': [50, 60, 70] * 5,
+                        'alt_DP': [20, 25, 30] * 5,
+                        'VAF': [0.4, 0.42, 0.43] * 5,
+                        'POS': list(range(130000000, 130000000 + 15 * 100000, 100000)),
+                    }
+                }
+            }
+        }
+        return collector
+
+    def test_init(self, mock_collector):
+        """Test GermlineModel initialization."""
+        model = GermlineModel(mock_collector, min_dp_cutoff=10, min_snp=5)
+        assert model._min_dp_cutoff == 10
+        assert model._min_snp == 5
+        assert not model.data_df.empty
+
+    def test_preprocess_data(self, mock_collector):
+        """Test data preprocessing."""
+        model = GermlineModel(mock_collector, min_dp_cutoff=10)
+        df = model.data_df
+
+        assert 'chrom' in df.columns
+        assert 'arm' in df.columns
+        assert 'depth' in df.columns
+        assert 'alt_count' in df.columns
+        assert len(df) > 0
+
+    def test_fit_skips_small_arms(self, mock_collector):
+        """Test that arms with few variants are skipped."""
+        # Modify mock to have very few variants on one arm
+        mock_collector.germline_vars['chr1']['q']['hetalt'] = {
+            'DP': [50, 60],
+            'alt_DP': [25, 30],
+            'VAF': [0.5, 0.5],
+            'POS': [130000000, 130100000],
+        }
+
+        model = GermlineModel(mock_collector, min_snp=10)
+        model.fit(num_warmup=50, num_samples=50)
+
+        # chr1q should use default values
+        assert 'chr1q' in model.arm_results
+        assert model.arm_results['chr1q']['p_diploid_score'] == 0.95
+
+
+class TestGermlineSegmentedModel:
+    """Tests for the horseshoe-fused SegmentedGermlineModel."""
+
+    @pytest.fixture
+    def mock_collector_with_methods(self):
+        """Create a mock GermlineVariantCollector with required methods."""
+        collector = Mock()
+
+        # Simulated diploid data
         np.random.seed(42)
-        n_het = 50
-        het_depth = np.random.randint(30, 100, size=n_het)
-        het_alt = np.random.binomial(het_depth, 0.5)
+        n_variants = 50
+        positions = np.sort(np.random.randint(1000000, 100000000, n_variants))
+        depths = np.random.randint(30, 100, n_variants)
+        alt_counts = np.random.binomial(depths, 0.48)  # Slight shift from 0.5
 
-        # Simulate hom variants around VAF=0.98
-        n_hom = 20
-        hom_depth = np.random.randint(30, 100, size=n_hom)
-        hom_alt = np.random.binomial(hom_depth, 0.98)
+        collector.get_available_chromosomes = Mock(return_value=['chr1'])
+        collector.get_chromosome_data = Mock(return_value=(positions, depths, alt_counts))
 
-        estimator = GermlineEstimator(chrom="chr1", arm="p")
-        estimator.fit(het_alt, het_depth, hom_alt, hom_depth)
+        # Also set germline_vars for arm_results property
+        collector.germline_vars = {'chr1': {'p': {}, 'q': {}}}
 
-        # Check parameters were set
-        assert estimator.mu_het is not None
-        assert estimator.kappa_het is not None
-        assert estimator.mu_hom is not None
-        assert estimator.kappa_hom is not None
+        return collector
 
-        # Check reasonable ranges
-        assert 0.3 < estimator.mu_het < 0.7
-        assert 0.9 < estimator.mu_hom < 1.0
-        assert estimator.n_het == n_het
-        assert estimator.n_hom == n_hom
-
-    def test_fit_het_only(self):
-        """Test fitting with only heterozygous variants."""
-        np.random.seed(42)
-        n_het = 30
-        het_depth = np.random.randint(30, 100, size=n_het)
-        het_alt = np.random.binomial(het_depth, 0.5)
-
-        estimator = GermlineEstimator(chrom="chr1", arm="q")
-        estimator.fit_het_only(het_alt, het_depth)
-
-        assert estimator.mu_het is not None
-        assert estimator.n_hom == 0
-
-    def test_fallback_with_few_variants(self):
-        """Test fallback behavior with insufficient variants."""
-        het_alt = np.array([15, 18])
-        het_depth = np.array([30, 35])
-
-        estimator = GermlineEstimator(chrom="chr2", arm="p")
-        estimator.fit(het_alt, het_depth, np.array([]), np.array([]))
-
-        # Should use fallback values
-        assert estimator.mu_het is not None
-        assert estimator.kappa_het == 50.0  # fallback kappa
-
-    def test_get_result(self):
-        """Test get_result returns proper structure."""
-        np.random.seed(42)
-        het_depth = np.random.randint(30, 100, size=30)
-        het_alt = np.random.binomial(het_depth, 0.5)
-
-        estimator = GermlineEstimator(chrom="chr1", arm="p")
-        estimator.fit_het_only(het_alt, het_depth)
-        result = estimator.get_result()
-
-        assert result.chrom == "chr1"
-        assert result.arm == "p"
-        assert result.mu_het is not None
-        assert result.n_het == 30
-
-    def test_get_result_before_fit_raises(self):
-        """Test that get_result raises if fit not called."""
-        estimator = GermlineEstimator(chrom="chr1", arm="p")
-        with pytest.raises(ValueError, match="Must call fit"):
-            estimator.get_result()
-
-    def test_allelic_imbalance(self):
-        """Test allelic imbalance calculation."""
-        estimator = GermlineEstimator(chrom="chr1", arm="p")
-        estimator.mu_het = 0.4
-        assert estimator.allelic_imbalance == pytest.approx(0.1)
-
-    def test_has_loh_signal(self):
-        """Test LOH signal detection."""
-        estimator = GermlineEstimator(chrom="chr1", arm="p")
-        estimator.mu_het = 0.35  # imbalance = 0.15
-        estimator.n_het = 50
-
-        assert estimator.has_loh_signal is True
-
-        estimator.mu_het = 0.48  # imbalance = 0.02
-        assert estimator.has_loh_signal is False
-
-
-class TestConvenienceFunctions:
-    """Test module-level convenience functions."""
-
-    def test_fit_germline(self):
-        """Test fit_germline function."""
-        np.random.seed(42)
-        het_depth = np.random.randint(30, 100, size=30)
-        het_alt = np.random.binomial(het_depth, 0.5)
-
-        result = fit_germline(
-            chrom="chr1",
-            arm="p",
-            het_alt=het_alt,
-            het_depth=het_depth,
+    def test_init(self, mock_collector_with_methods):
+        """Test SegmentedGermlineModel initialization."""
+        model = SegmentedGermlineModel(
+            mock_collector_with_methods,
+            min_dp_cutoff=10,
+            min_variants_per_chrom=20,
+            tau_scale=0.01,
         )
 
-        assert result.chrom == "chr1"
-        assert result.mu_het is not None
+        assert model._min_dp_cutoff == 10
+        assert model._min_variants_per_chrom == 20
+        assert model._tau_scale == 0.01
 
-    def test_fit_germline_from_combined(self):
-        """Test fit_germline_from_combined function."""
-        np.random.seed(42)
-
-        # Combined arrays
-        n_het, n_hom = 30, 15
-        het_depth = np.random.randint(30, 100, size=n_het)
-        het_alt = np.random.binomial(het_depth, 0.5)
-        hom_depth = np.random.randint(30, 100, size=n_hom)
-        hom_alt = np.random.binomial(hom_depth, 0.98)
-
-        alt = np.concatenate([het_alt, hom_alt])
-        depth = np.concatenate([het_depth, hom_depth])
-        is_het = np.array([True] * n_het + [False] * n_hom)
-
-        result = fit_germline_from_combined(
-            chrom="chr1",
-            arm="q",
-            alt=alt,
-            depth=depth,
-            is_het=is_het,
+    def test_filter_by_depth(self, mock_collector_with_methods):
+        """Test depth filtering."""
+        model = SegmentedGermlineModel(
+            mock_collector_with_methods,
+            min_dp_cutoff=50
         )
 
-        assert result.n_het == n_het
-        assert result.n_hom == n_hom
+        positions = np.array([100, 200, 300, 400])
+        depths = np.array([30, 60, 40, 80])
+        alt_counts = np.array([15, 30, 20, 40])
+
+        pos_f, dep_f, alt_f = model._filter_by_depth(positions, depths, alt_counts)
+
+        assert len(pos_f) == 2  # Only depths >= 50
+        np.testing.assert_array_equal(pos_f, [200, 400])
+
+    def test_get_segment_lookup(self, mock_collector_with_methods):
+        """Test that segment lookup is created after fit."""
+        model = SegmentedGermlineModel(
+            mock_collector_with_methods,
+            min_variants_per_chrom=10
+        )
+
+        # Before fit, should build lookup from empty results
+        lookup = model.get_segment_lookup()
+        assert lookup is not None
+
+    def test_arm_results_property(self, mock_collector_with_methods):
+        """Test backward compatibility via arm_results property."""
+        model = SegmentedGermlineModel(
+            mock_collector_with_methods,
+            min_variants_per_chrom=100  # Force skip
+        )
+
+        # Add a default result manually
+        from CBBmix.utils import SegmentResult, ChromosomeSegmentationResult
+        model.chrom_results['chr1'] = ChromosomeSegmentationResult(
+            chrom='chr1',
+            n_variants=50,
+            n_segments=1,
+            delta_mean=0.01,
+            delta_std=0.005,
+            kappa_mean=50.0,
+            kappa_std=5.0,
+            segments=[
+                SegmentResult(
+                    segment_id=0,
+                    start_position=1000000,
+                    end_position=150000000,
+                    n_variants=50,
+                    psi_mean=0.1,
+                    psi_std=0.05,
+                )
+            ],
+            variant_segment_ids=np.zeros(50),
+            positions=np.arange(50) * 1000000 + 1000000,
+        )
+
+        arm_results = model.arm_results
+
+        # Should have entries for chr1p and chr1q
+        assert 'chr1p' in arm_results or 'chr1q' in arm_results
+        # Check structure
+        for key, val in arm_results.items():
+            assert 'psi_mean' in val
+            assert 'delta_mean' in val
+            assert 'kappa_mean' in val
+
+
+class TestGermlineSegmentedModelFunction:
+    """Tests for the germline_segmented_model numpyro function."""
+
+    def test_model_runs(self):
+        """Test that the model runs without error."""
+        import numpyro
+        from numpyro.infer import MCMC, NUTS
+
+        np.random.seed(42)
+        n_variants = 20
+        depths = jnp.array(np.random.randint(30, 100, n_variants))
+        alt_counts = jnp.array(np.random.binomial(depths, 0.5))
+        positions = jnp.array(np.sort(np.random.randint(1e6, 1e8, n_variants)))
+        d_scaled = compute_scaled_distances(positions)
+
+        kernel = NUTS(germline_segmented_model)
+        mcmc = MCMC(kernel, num_warmup=10, num_samples=10, num_chains=1)
+
+        # Should run without error
+        mcmc.run(jax.random.PRNGKey(0), alt_counts, depths, d_scaled, 0.01)
+
+        samples = mcmc.get_samples()
+
+        # Check expected sample keys
+        assert 'delta' in samples
+        assert 'phi' in samples
+        assert 'kappa' in samples
+        assert 'psi' in samples
+        assert 'tau' in samples
+        assert 'lambdas' in samples
+        assert 'z_raw' in samples
+        assert 'increments_scaled' in samples
+
+        # Check shapes
+        assert samples['psi'].shape == (10, n_variants)
+        assert samples['delta'].shape == (10,)
+        assert samples['increments_scaled'].shape == (10, n_variants - 1)
+
+    def test_model_psi_cumulative(self):
+        """Test that psi is cumulative from increments."""
+        import numpyro
+        from numpyro.infer import MCMC, NUTS
+
+        np.random.seed(123)
+        n_variants = 10
+        depths = jnp.array(np.full(n_variants, 50))
+        alt_counts = jnp.array(np.full(n_variants, 25))  # VAF = 0.5
+        positions = jnp.array(np.arange(n_variants) * 1000000)
+        d_scaled = compute_scaled_distances(positions)
+
+        kernel = NUTS(germline_segmented_model)
+        mcmc = MCMC(kernel, num_warmup=10, num_samples=10, num_chains=1)
+        mcmc.run(jax.random.PRNGKey(1), alt_counts, depths, d_scaled, 0.01)
+
+        samples = mcmc.get_samples()
+        psi = samples['psi']
+
+        # psi should be non-negative (absolute value)
+        assert jnp.all(psi >= 0)
+
+
+class TestIntegration:
+    """Integration tests for germline models."""
+
+    def test_segmented_model_creates_valid_lookup(self):
+        """Test full pipeline from collector to lookup."""
+        from CBBmix.utils import SegmentResult, ChromosomeSegmentationResult
+
+        # Create mock collector
+        collector = Mock()
+        np.random.seed(42)
+        n = 30
+        positions = np.sort(np.random.randint(1e6, 1e8, n))
+        depths = np.random.randint(30, 100, n)
+        alt_counts = np.random.binomial(depths, 0.5)
+
+        collector.get_available_chromosomes = Mock(return_value=['chr1'])
+        collector.get_chromosome_data = Mock(return_value=(positions, depths, alt_counts))
+        collector.germline_vars = {'chr1': {'p': {}, 'q': {}}}
+
+        model = SegmentedGermlineModel(
+            collector,
+            min_variants_per_chrom=100  # Skip fitting
+        )
+
+        # Manually add result
+        model.chrom_results['chr1'] = ChromosomeSegmentationResult(
+            chrom='chr1',
+            n_variants=n,
+            n_segments=1,
+            delta_mean=0.01,
+            delta_std=0.005,
+            kappa_mean=50.0,
+            kappa_std=5.0,
+            segments=[
+                SegmentResult(0, int(positions[0]), int(positions[-1]), n, 0.05, 0.02)
+            ],
+            variant_segment_ids=np.zeros(n),
+            positions=positions,
+        )
+
+        lookup = model.get_segment_lookup()
+
+        # Query should work
+        seg = lookup.query('chr1', int(positions[n // 2]))
+        assert seg is not None
+        assert seg.psi_mean == 0.05
+        assert seg.delta_mean == 0.01
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

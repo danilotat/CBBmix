@@ -27,11 +27,12 @@ import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
 from numpyro.handlers import seed, trace
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from dataclasses import dataclass
 
-from germline import GermlineModel
-from vcf import SomaticVariantCollector
+from .germline import GermlineModel, SegmentedGermlineModel
+from .vcf import SomaticVariantCollector
+from .utils import SegmentLookup
 
 jax.config.update("jax_enable_x64", True)
 
@@ -91,7 +92,7 @@ class SomaticModel:
     def __init__(
         self,
         somatic_collector_data: SomaticVariantCollector,
-        germline_model: GermlineModel,
+        germline_model: Union[GermlineModel, SegmentedGermlineModel],
         prior_config: Optional[SomaticPriorConfig] = None,
         min_dp_cutoff: int = 10,
         use_germline_samples: bool = False,
@@ -103,8 +104,14 @@ class SomaticModel:
         self._min_dp_cutoff = min_dp_cutoff
         self._use_germline_samples = use_germline_samples
 
-        # Preprocess data to link variants with arm-level germline parameters
-        self.data_df = self._preprocess_data()
+        # Detect germline model type and preprocess accordingly
+        self._use_segments = isinstance(germline_model, SegmentedGermlineModel)
+        if self._use_segments:
+            self.segment_lookup = germline_model.get_segment_lookup()
+            self.data_df = self._preprocess_data_segmented()
+        else:
+            self.segment_lookup = None
+            self.data_df = self._preprocess_data()
 
         # Store inference results
         self.mcmc = None
@@ -155,6 +162,78 @@ class SomaticModel:
                             'chrom': chrom,
                             'arm': arm,
                             'arm_key': arm_key,
+                            'depth': int(d),
+                            'alt_count': int(ad),
+                            'vaf': float(v),
+                            'arm_delta': float(g_delta),
+                            'arm_kappa': float(g_kappa),
+                            'arm_psi': float(g_psi),
+                        })
+                except Exception as e:
+                    logging.debug(f"No somatic variants for {chrom}{arm}: {e}")
+
+        df = pd.DataFrame(records)
+        if not df.empty:
+            df = df[df['depth'] >= self._min_dp_cutoff]
+
+        return df
+
+    def _preprocess_data_segmented(self) -> pd.DataFrame:
+        """
+        Extract somatic variants and map them to segment-level germline parameters.
+
+        Uses SegmentLookup for O(log N) position-to-segment mapping.
+
+        Returns DataFrame with columns:
+        - chrom, arm, position: variant location
+        - depth, alt_count, vaf: variant read data
+        - arm_delta, arm_kappa, arm_psi: segment-level parameters
+        """
+        records = []
+
+        for chrom, arms in self.raw_data.somatic_vars.items():
+            for arm in arms:
+                try:
+                    arm_data = self.raw_data.somatic_vars[chrom][arm]
+                    dps = arm_data['DP']
+                    alt_dps = arm_data['alt_DP']
+                    vafs = arm_data['VAF']
+                    positions = arm_data.get('POS', [None] * len(dps))
+
+                    for d, ad, v, pos in zip(dps, alt_dps, vafs, positions):
+                        # Query segment lookup for this position
+                        if pos is not None and self.segment_lookup is not None:
+                            seg_info = self.segment_lookup.query(chrom, pos)
+                            if seg_info is not None:
+                                g_delta = seg_info.delta_mean
+                                g_kappa = seg_info.kappa_mean
+                                g_psi = seg_info.psi_mean
+                            else:
+                                # Fallback to defaults
+                                g_delta = 0.0
+                                g_kappa = 10.0
+                                g_psi = 0.0
+                        else:
+                            # No position or lookup - use arm-level fallback
+                            arm_key = f"{chrom}{arm}"
+                            if arm_key in self.germline_results:
+                                arm_stats = self.germline_results[arm_key]
+                                g_delta = arm_stats.get('delta_mean', 0.0)
+                                g_kappa = arm_stats.get('kappa_mean', 10.0)
+                                g_psi = arm_stats.get('psi_mean', 0.0)
+                            else:
+                                g_delta = 0.0
+                                g_kappa = 10.0
+                                g_psi = 0.0
+
+                        # Cap kappa
+                        g_kappa = min(g_kappa, self.prior_config.max_kappa)
+
+                        records.append({
+                            'chrom': chrom,
+                            'arm': arm,
+                            'arm_key': f"{chrom}{arm}",
+                            'position': int(pos) if pos is not None else 0,
                             'depth': int(d),
                             'alt_count': int(ad),
                             'vaf': float(v),

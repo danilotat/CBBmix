@@ -29,7 +29,7 @@ _CHROMOSOME_ARMS = [
     ('chrX', 0, 61000000, 'p'), ('chrX', 61000000, 156040895, 'q'),
     ('chrY', 0, 10400000, 'p'), ('chrY', 10400000, 57227415, 'q'),
 ]
-
+_FILTERS_TO_EXCLUDE = ['PoN', 'GIAB']
 
 def read_genotypes(genotype: list):
     """Shared helper function for genotype classification."""
@@ -43,16 +43,18 @@ def read_genotypes(genotype: list):
 
 
 class ChromosomeArmLookup:
+    """Extremely simple arm lookup class. Remind that:
+        `p`: small arm
+        `q`: big arm
+    """
     def __init__(self, data):
         self.centromeres = {}
         self.chr_ends = {}
-        
         for row in data:
             chrom, start, end, arm = row
             if chrom not in self.centromeres:
                 self.centromeres[chrom] = None
                 self.chr_ends[chrom] = 0
-            
             if arm == 'p':
                 self.centromeres[chrom] = end
             self.chr_ends[chrom] = max(self.chr_ends[chrom], end)
@@ -65,6 +67,7 @@ class ChromosomeArmLookup:
         return 'p' if pos < centromere else 'q'
     
     def query_array(self, chroms, positions):
+        """Arrayed version of the same query"""
         chroms = np.asarray(chroms)
         positions = np.asarray(positions)
         centromere_positions = np.array([
@@ -73,7 +76,6 @@ class ChromosomeArmLookup:
         result = np.where(positions < centromere_positions, 'p', 'q')
         unknown_mask = np.array([c not in self.centromeres for c in chroms])
         result[unknown_mask] = None
-        
         return result
 
         
@@ -101,39 +103,86 @@ class SomaticVariantCollector:
                     variant.gt_alt_depths[0])
                 som_vars[variant.CHROM][arm]['VAF'].append(
                     variant.gt_alt_freqs[0])
+                som_vars[variant.CHROM][arm]['POS'].append(
+                    int(variant.POS))
         return som_vars
 
 
 class GermlineVariantCollector:
-    def __init__(self, vcf, af_thresholds=[0.25, 0.75]):
+    def __init__(self, vcf, filters_to_exclude=_FILTERS_TO_EXCLUDE, af_thresholds=[0.35, 0.65], min_dp=10):
         self._chrs_arms_lookup = ChromosomeArmLookup(_CHROMOSOME_ARMS)
         self.vcf_file = VCF(vcf)
         self._af_thresholds = af_thresholds
+        self._filters_to_exclude = filters_to_exclude
         self._csq_keys = [
             j.strip() for j in self.vcf_file.get_header_type('CSQ')['Description'].replace('"','').split('Format: ')[1].split('|')
         ] 
         self.germline_vars = self._collect_germline_vars() 
 
     def _collect_germline_vars(self):
-        germ_vars = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list))))
+        germ_vars = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         for variant in self.vcf_file:
             # let's take advantage of ENEO annotation. 
             # as we want only stuff that we could trust, we couldn't go 
             # too much away from a boundary over the 0.5 median
             hetprob = variant.INFO.get('hetProb') 
             af = variant.gt_alt_freqs[0]
-            if all([hetprob > 0.5, af >= self._af_thresholds[0], af <= self._af_thresholds[1]]):
+            if all(
+                [
+                    hetprob > 0.5,
+                    af >= self._af_thresholds[0],
+                    af <= self._af_thresholds[1],
+                    variant.FILTER not in self._filters_to_exclude,
+                    variant.gt_depths[0] > 10
+                ]):
                 arm = self._chrs_arms_lookup.query(
                     variant.CHROM, int(variant.POS)
                 )
-                # TODO: this last block should removed as we're interested just in het variants.
                 genotype = read_genotypes(variant.genotypes[0])
-                if genotype != 'skip':
-                    germ_vars[variant.CHROM][arm][genotype]['DP'].append(
+                if genotype == 'hetalt':
+                    germ_vars[variant.CHROM][arm]['DP'].append(
                         variant.gt_depths[0]
                     )
-                    germ_vars[variant.CHROM][arm][genotype]['alt_DP'].append(
+                    germ_vars[variant.CHROM][arm]['alt_DP'].append(
                         variant.gt_alt_depths[0])
-                    germ_vars[variant.CHROM][arm][genotype]['VAF'].append(
+                    germ_vars[variant.CHROM][arm]['VAF'].append(
                         variant.gt_alt_freqs[0])
+                    germ_vars[variant.CHROM][arm]['POS'].append(
+                        int(variant.POS))
         return germ_vars
+
+    def get_chromosome_data(self, chrom):
+        """
+        Get all heterozygous variants for a chromosome, sorted by position.
+
+        Returns
+        -------
+        positions : np.ndarray
+            Sorted genomic positions
+        depths : np.ndarray
+            Total read depths
+        alt_counts : np.ndarray
+            Alternate allele counts
+        """
+        positions = []
+        depths = []
+        alt_counts = []
+        if chrom not in self.germline_vars:
+            return np.array([]), np.array([]), np.array([])
+        for arm in self.germline_vars[chrom]:
+            arm_data = self.germline_vars[chrom][arm]
+            positions.extend(arm_data.get('POS', []))
+            depths.extend(arm_data.get('DP', []))
+            alt_counts.extend(arm_data.get('alt_DP', []))
+        if not positions:
+            return np.array([]), np.array([]), np.array([])
+        # Sort by position
+        positions = np.array(positions)
+        depths = np.array(depths)
+        alt_counts = np.array(alt_counts)
+        sort_idx = np.argsort(positions)
+        return positions[sort_idx], depths[sort_idx], alt_counts[sort_idx]
+
+    def get_available_chromosomes(self):
+        """Return list of chromosomes with germline variants."""
+        return list(self.germline_vars.keys())

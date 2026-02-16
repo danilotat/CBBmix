@@ -25,9 +25,9 @@ import numpy as np
 import pandas as pd
 import jax
 
-from vcf import GermlineVariantCollector, SomaticVariantCollector
-from germline import GermlineModel
-from somatic import SomaticModel, SomaticPriorConfig
+from .vcf import GermlineVariantCollector, SomaticVariantCollector
+from .germline import GermlineModel
+from .somatic import SomaticModel, SomaticPriorConfig
 
 # Enable 64-bit precision for JAX
 jax.config.update("jax_enable_x64", True)

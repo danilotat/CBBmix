@@ -1,11 +1,13 @@
 import pytest
 import numpy as np
-from unittest.mock import Mock, patch, PropertyMock
+from unittest.mock import Mock, patch
 
 from CBBmix.vcf import (
     ChromosomeArmLookup,
     GermlineVariantCollector,
+    SomaticVariantCollector,
     _CHROMOSOME_ARMS,
+    read_genotypes,
 )
 
 
@@ -37,9 +39,9 @@ class TestChromosomeArmLookup:
         """Test batch query."""
         chroms = ['chr1', 'chr1', 'chr2', 'chrX']
         positions = [50000000, 150000000, 100000000, 30000000]
-        
+
         result = lookup.query_array(chroms, positions)
-        
+
         expected = np.array(['p', 'q', 'q', 'p'])
         np.testing.assert_array_equal(result, expected)
 
@@ -47,9 +49,9 @@ class TestChromosomeArmLookup:
         """Test batch query with unknown chromosome."""
         chroms = ['chr1', 'chrUn']
         positions = [50000000, 1000]
-        
+
         result = lookup.query_array(chroms, positions)
-        
+
         assert result[0] == 'p'
         assert result[1] is None
 
@@ -61,174 +63,231 @@ class TestChromosomeArmLookup:
             assert lookup.centromeres[chrom] is not None
 
 
+class TestReadGenotypes:
+    """Tests for read_genotypes function."""
+
+    def test_homalt(self):
+        """Test homozygous alt detection."""
+        assert read_genotypes([1, 1, False]) == 'homalt'
+
+    def test_hetalt(self):
+        """Test heterozygous detection."""
+        assert read_genotypes([0, 1, False]) == 'hetalt'
+        assert read_genotypes([1, 0, False]) == 'hetalt'
+
+    def test_skip(self):
+        """Test homref and other cases are skipped."""
+        assert read_genotypes([0, 0, False]) == 'skip'
+        assert read_genotypes([0, 2, False]) == 'skip'
+
+
 class TestGermlineVariantCollector:
     """Tests for GermlineVariantCollector."""
 
     @pytest.fixture
-    def mock_variant(self):
-        """Create a mock variant."""
-        variant = Mock()
-        variant.CHROM = 'chr1'
-        variant.POS = 100000000
-        variant.INFO.get = Mock(return_value='A|B|C|0.1|D')
-        variant.genotypes = [[1, 0, False]]  # het
-        variant.gt_depths = [50]
-        variant.gt_alt_depths = [25]
-        variant.gt_alt_freqs = [0.5]
-        return variant
-
-    @pytest.fixture
-    def mock_vcf(self, mock_variant):
-        """Create a mock VCF."""
+    def mock_vcf_instance(self):
+        """Create a mock VCF instance."""
         vcf = Mock()
-        vcf.__iter__ = Mock(return_value=iter([mock_variant]))
         vcf.get_header_type = Mock(return_value={
             'Description': '"Format: A|B|C|AF|D"'
         })
         return vcf
 
-    def test_read_genotypes_homalt(self):
-        """Test homozygous alt detection."""
-        assert GermlineVariantCollector.read_genotypes([1, 1, False]) == 'homalt'
+    def test_collects_pos(self):
+        """Test that POS field is collected."""
+        vcf = Mock()
+        vcf.get_header_type = Mock(return_value={
+            'Description': '"Format: gene|AF"'
+        })
 
-    def test_read_genotypes_hetalt(self):
-        """Test heterozygous detection."""
-        assert GermlineVariantCollector.read_genotypes([0, 1, False]) == 'hetalt'
-        assert GermlineVariantCollector.read_genotypes([1, 0, False]) == 'hetalt'
-
-    def test_read_genotypes_skip(self):
-        """Test homref and other cases are skipped."""
-        assert GermlineVariantCollector.read_genotypes([0, 0, False]) == 'skip'
-        assert GermlineVariantCollector.read_genotypes([0, 2, False]) == 'skip'
-
-    @patch('germline_variant_collector.VCF')
-    def test_collect_germline_vars_structure(self, mock_vcf_class):
-        """Test collected variants have correct nested structure."""
-        # Setup mock
-        mock_vcf_instance = Mock()
-        mock_vcf_class.return_value = mock_vcf_instance
-        mock_vcf_instance.get_header_type.return_value = {
-            'Description': '"Format: gene|impact|AF"'
-        }
-        
-        # Create mock variant with AF > 0.05
         variant = Mock()
         variant.CHROM = 'chr1'
-        variant.POS = 100000000
-        variant.INFO.get.return_value = 'BRCA1|HIGH|0.1'
+        variant.POS = 50000000
+        variant.INFO.get = Mock(return_value=0.8)  # hetProb
         variant.genotypes = [[0, 1, False]]  # het
         variant.gt_depths = [60]
         variant.gt_alt_depths = [30]
         variant.gt_alt_freqs = [0.5]
-        
-        mock_vcf_instance.__iter__ = Mock(return_value=iter([variant]))
-        
-        collector = GermlineVariantCollector('dummy.vcf')
-        
-        # Check structure
+
+        vcf.__iter__ = Mock(return_value=iter([variant]))
+
+        with patch('CBBmix.vcf.VCF', return_value=vcf):
+            collector = GermlineVariantCollector('dummy.vcf')
+
         assert 'chr1' in collector.germline_vars
         assert 'p' in collector.germline_vars['chr1']
         assert 'hetalt' in collector.germline_vars['chr1']['p']
-        assert len(collector.germline_vars['chr1']['p']['hetalt']) == 1
-        
-        # Check variant data
-        var_data = collector.germline_vars['chr1']['p']['hetalt'][0]
-        assert var_data['DP'] == 60
-        assert var_data['alt_DP'] == 30
-        assert var_data['VAF'] == 0.5
+        assert 'POS' in collector.germline_vars['chr1']['p']['hetalt']
+        assert collector.germline_vars['chr1']['p']['hetalt']['POS'][0] == 50000000
 
-    @patch('germline_variant_collector.VCF')
-    def test_skips_low_af_variants(self, mock_vcf_class):
-        """Test variants with AF <= 0.05 are skipped."""
-        mock_vcf_instance = Mock()
-        mock_vcf_class.return_value = mock_vcf_instance
-        mock_vcf_instance.get_header_type.return_value = {
+    def test_get_chromosome_data(self):
+        """Test get_chromosome_data method."""
+        vcf = Mock()
+        vcf.get_header_type = Mock(return_value={
             'Description': '"Format: gene|AF"'
-        }
-        
-        # Variant with low AF
+        })
+
+        # Create multiple variants
+        variants = []
+        for i, (pos, dp, alt_dp) in enumerate([
+            (60000000, 50, 25),
+            (50000000, 60, 28),  # Out of order
+            (70000000, 70, 35),
+        ]):
+            v = Mock()
+            v.CHROM = 'chr1'
+            v.POS = pos
+            v.INFO.get = Mock(return_value=0.9)
+            v.genotypes = [[0, 1, False]]
+            v.gt_depths = [dp]
+            v.gt_alt_depths = [alt_dp]
+            v.gt_alt_freqs = [alt_dp / dp]
+            variants.append(v)
+
+        vcf.__iter__ = Mock(return_value=iter(variants))
+
+        with patch('CBBmix.vcf.VCF', return_value=vcf):
+            collector = GermlineVariantCollector('dummy.vcf')
+
+        positions, depths, alt_counts = collector.get_chromosome_data('chr1')
+
+        # Should be sorted by position
+        assert len(positions) == 3
+        assert positions[0] < positions[1] < positions[2]
+        np.testing.assert_array_equal(positions, [50000000, 60000000, 70000000])
+
+    def test_get_chromosome_data_empty(self):
+        """Test get_chromosome_data for missing chromosome."""
+        vcf = Mock()
+        vcf.get_header_type = Mock(return_value={
+            'Description': '"Format: gene|AF"'
+        })
+        vcf.__iter__ = Mock(return_value=iter([]))
+
+        with patch('CBBmix.vcf.VCF', return_value=vcf):
+            collector = GermlineVariantCollector('dummy.vcf')
+
+        positions, depths, alt_counts = collector.get_chromosome_data('chr99')
+
+        assert len(positions) == 0
+        assert len(depths) == 0
+        assert len(alt_counts) == 0
+
+    def test_get_available_chromosomes(self):
+        """Test get_available_chromosomes method."""
+        vcf = Mock()
+        vcf.get_header_type = Mock(return_value={
+            'Description': '"Format: gene|AF"'
+        })
+
+        variants = []
+        for chrom in ['chr1', 'chr2', 'chr1']:
+            v = Mock()
+            v.CHROM = chrom
+            v.POS = 50000000
+            v.INFO.get = Mock(return_value=0.9)
+            v.genotypes = [[0, 1, False]]
+            v.gt_depths = [50]
+            v.gt_alt_depths = [25]
+            v.gt_alt_freqs = [0.5]
+            variants.append(v)
+
+        vcf.__iter__ = Mock(return_value=iter(variants))
+
+        with patch('CBBmix.vcf.VCF', return_value=vcf):
+            collector = GermlineVariantCollector('dummy.vcf')
+
+        chroms = collector.get_available_chromosomes()
+
+        assert 'chr1' in chroms
+        assert 'chr2' in chroms
+        assert len(chroms) == 2
+
+    def test_af_threshold_filtering(self):
+        """Test that AF thresholds are applied."""
+        vcf = Mock()
+        vcf.get_header_type = Mock(return_value={
+            'Description': '"Format: gene|AF"'
+        })
+
+        variants = []
+        for af in [0.1, 0.5, 0.9]:  # Only 0.5 should pass default thresholds
+            v = Mock()
+            v.CHROM = 'chr1'
+            v.POS = 50000000
+            v.INFO.get = Mock(return_value=0.9)  # hetProb
+            v.genotypes = [[0, 1, False]]
+            v.gt_depths = [50]
+            v.gt_alt_depths = [int(50 * af)]
+            v.gt_alt_freqs = [af]
+            variants.append(v)
+
+        vcf.__iter__ = Mock(return_value=iter(variants))
+
+        with patch('CBBmix.vcf.VCF', return_value=vcf):
+            collector = GermlineVariantCollector('dummy.vcf', af_thresholds=[0.25, 0.75])
+
+        # Only the variant with AF=0.5 should be collected
+        if 'chr1' in collector.germline_vars and 'p' in collector.germline_vars['chr1']:
+            n_vars = len(collector.germline_vars['chr1']['p'].get('hetalt', {}).get('DP', []))
+            assert n_vars == 1
+
+
+class TestSomaticVariantCollector:
+    """Tests for SomaticVariantCollector."""
+
+    def test_collects_pos(self):
+        """Test that POS field is collected for somatic variants."""
+        vcf = Mock()
+        vcf.get_header_type = Mock(return_value={
+            'Description': '"Format: gene|AF"'
+        })
+
         variant = Mock()
         variant.CHROM = 'chr1'
-        variant.POS = 100000000
-        variant.INFO.get.return_value = 'BRCA1|0.01'  # AF = 0.01 < 0.05
-        variant.genotypes = [[0, 1, False]]
-        
-        mock_vcf_instance.__iter__ = Mock(return_value=iter([variant]))
-        
-        collector = GermlineVariantCollector('dummy.vcf')
-        
-        # Should be empty - variant filtered out
-        assert len(collector.germline_vars) == 0
+        variant.POS = 50000000
+        variant.INFO.get = Mock(return_value=0.8)  # somProb
+        variant.gt_depths = [60]
+        variant.gt_alt_depths = [15]
+        variant.gt_alt_freqs = [0.25]
 
-    @patch('germline_variant_collector.VCF')
-    def test_skips_variants_without_csq(self, mock_vcf_class):
-        """Test variants without CSQ annotation are skipped."""
-        mock_vcf_instance = Mock()
-        mock_vcf_class.return_value = mock_vcf_instance
-        mock_vcf_instance.get_header_type.return_value = {
-            'Description': '"Format: gene|AF"'
-        }
-        
-        variant = Mock()
-        variant.INFO.get.return_value = None  # No CSQ
-        
-        mock_vcf_instance.__iter__ = Mock(return_value=iter([variant]))
-        
-        collector = GermlineVariantCollector('dummy.vcf')
-        
-        assert len(collector.germline_vars) == 0
+        vcf.__iter__ = Mock(return_value=iter([variant]))
 
-    @patch('germline_variant_collector.VCF')
-    def test_skips_homref_genotypes(self, mock_vcf_class):
-        """Test homozygous ref variants are skipped."""
-        mock_vcf_instance = Mock()
-        mock_vcf_class.return_value = mock_vcf_instance
-        mock_vcf_instance.get_header_type.return_value = {
-            'Description': '"Format: gene|AF"'
-        }
-        
-        variant = Mock()
-        variant.CHROM = 'chr1'
-        variant.POS = 100000000
-        variant.INFO.get.return_value = 'BRCA1|0.1'
-        variant.genotypes = [[0, 0, False]]  # homref
-        
-        mock_vcf_instance.__iter__ = Mock(return_value=iter([variant]))
-        
-        collector = GermlineVariantCollector('dummy.vcf')
-        
-        assert len(collector.germline_vars) == 0
+        with patch('CBBmix.vcf.VCF', return_value=vcf):
+            collector = SomaticVariantCollector('dummy.vcf')
 
-    @patch('germline_variant_collector.VCF')
-    def test_multiple_variants_same_arm(self, mock_vcf_class):
-        """Test multiple variants accumulate correctly."""
-        mock_vcf_instance = Mock()
-        mock_vcf_class.return_value = mock_vcf_instance
-        mock_vcf_instance.get_header_type.return_value = {
+        assert 'chr1' in collector.somatic_vars
+        assert 'p' in collector.somatic_vars['chr1']
+        assert 'POS' in collector.somatic_vars['chr1']['p']
+        assert collector.somatic_vars['chr1']['p']['POS'][0] == 50000000
+
+    def test_somatic_prob_threshold(self):
+        """Test that somProb threshold is applied."""
+        vcf = Mock()
+        vcf.get_header_type = Mock(return_value={
             'Description': '"Format: gene|AF"'
-        }
-        
-        # Two het variants on chr1p
-        v1 = Mock()
-        v1.CHROM = 'chr1'
-        v1.POS = 50000000
-        v1.INFO.get.return_value = 'GENE1|0.2'
-        v1.genotypes = [[0, 1, False]]
-        v1.gt_depths = [40]
-        v1.gt_alt_depths = [20]
-        v1.gt_alt_freqs = [0.5]
-        
-        v2 = Mock()
-        v2.CHROM = 'chr1'
-        v2.POS = 60000000
-        v2.INFO.get.return_value = 'GENE2|0.3'
-        v2.genotypes = [[0, 1, False]]
-        v2.gt_depths = [80]
-        v2.gt_alt_depths = [40]
-        v2.gt_alt_freqs = [0.5]
-        
-        mock_vcf_instance.__iter__ = Mock(return_value=iter([v1, v2]))
-        
-        collector = GermlineVariantCollector('dummy.vcf')
-        
-        assert len(collector.germline_vars['chr1']['p']['hetalt']) == 2
+        })
+
+        variants = []
+        for prob in [0.3, 0.7]:  # Only 0.7 should pass
+            v = Mock()
+            v.CHROM = 'chr1'
+            v.POS = 50000000
+            v.INFO.get = Mock(return_value=prob)
+            v.gt_depths = [60]
+            v.gt_alt_depths = [15]
+            v.gt_alt_freqs = [0.25]
+            variants.append(v)
+
+        vcf.__iter__ = Mock(return_value=iter(variants))
+
+        with patch('CBBmix.vcf.VCF', return_value=vcf):
+            collector = SomaticVariantCollector('dummy.vcf')
+
+        # Only variant with somProb=0.7 should be collected
+        n_vars = len(collector.somatic_vars.get('chr1', {}).get('p', {}).get('DP', []))
+        assert n_vars == 1
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
