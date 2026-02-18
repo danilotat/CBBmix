@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from CBBmix.baf import compute_baf
 from CBBmix.hmm import BetaBinomialHMM
-from CBBmix.plotting import plot_baf
+from CBBmix.plotting import BAFPlotter
 
 
 def main():
@@ -26,8 +26,9 @@ def main():
         args.bam, args.ref, args.region, min_depth=args.min_depth,
     )
     print(f"Region {args.region}: {len(positions)} het sites found")
+    plotter = BAFPlotter(args.region, positions, depth, alt_depth)
     fig, ax = plt.subplots(figsize=(10, 1))
-    ax = plot_baf(positions, depth, alt_depth)
+    ax = plotter.plot(ax=ax)
     fig.tight_layout()
     fig.savefig(f"{args.region}_baf.png", dpi=300, bbox_inches='tight')
 

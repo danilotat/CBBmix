@@ -65,7 +65,8 @@ from .utils import (
     build_somatic_prior_from_germline,
 )
 from .plotting import (
-    VariantHandler
+    VariantHandler,
+    BAFPlotter,
 )
 from .baf import compute_baf, compute_baf_genome, HAS_BAF_EXTENSION
 
@@ -93,6 +94,7 @@ __all__ = [
     "build_somatic_prior_from_germline",
     # Plotting
     "VariantHandler",
+    "BAFPlotter",
     # BAF extension
     "compute_baf",
     "compute_baf_genome",
