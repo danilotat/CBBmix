@@ -3,8 +3,10 @@
 
 import argparse
 import numpy as np
+import matplotlib.pyplot as plt
 from CBBmix.baf import compute_baf
 from CBBmix.hmm import BetaBinomialHMM
+from CBBmix.plotting import plot_baf
 
 
 def main():
@@ -24,6 +26,10 @@ def main():
         args.bam, args.ref, args.region, min_depth=args.min_depth,
     )
     print(f"Region {args.region}: {len(positions)} het sites found")
+    fig, ax = plt.subplots(figsize=(10, 1))
+    ax = plot_baf(positions, depth, alt_depth)
+    fig.tight_layout()
+    fig.savefig(f"{args.region}_baf.png", dpi=300, bbox_inches='tight')
 
     if len(positions) < 10:
         print("Too few sites – skipping HMM fit.")

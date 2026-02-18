@@ -6,6 +6,32 @@ import pandas as pd
 from matplotlib.axes import Axes
 import matplotlib.ticker as ticker
 
+
+class BAFPlotter:
+    def __init__(self, region: str, pos, depth, alt_depth):
+        self.region = region
+        self.pos = pos
+        self.depth = depth
+        self.alt_depth = alt_depth
+    
+    def plot(self, ax: Axes = None, **kwargs) -> Axes:
+        if ax is None:
+            _, ax = plt.subplots(figsize=(10, 1))
+        vaf = self.alt_depth / self.depth
+        sns.scatterplot(
+            x=self.pos, y=vaf,
+            ax=ax, **kwargs  
+        )
+        ax.xaxis.set_major_formatter(
+            ticker.FuncFormatter(lambda x, pos: f'{x/1e6:.0f}M')
+        )
+        ax.axhline(.5, lw=.5, color='grey', linestyle='--')
+        ax.set_ylim(0,1)
+        ax.set_title(self.region)
+        for direction in ['top', 'right']:
+            ax.spines[direction].set_visible(False)
+        return ax
+
 class VariantHandler:
     def __init__(self, vc: GermlineVariantCollector):
         self.vc = vc
