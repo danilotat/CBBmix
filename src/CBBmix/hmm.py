@@ -276,8 +276,21 @@ class BaseHMM:
             log_pi        : (K,) log initial state distribution
         """
         K = self.n_states
-        mu_raw = numpyro.sample("mu_raw", dist.Uniform(0.0, 0.5).expand([K]))
-        mu = numpyro.deterministic("mu", jnp.sort(mu_raw))
+        mu_ref = numpyro.sample("mu_ref", dist.Uniform(0.40, 0.50))
+        
+        # Sample Abnormal Means (States 0..K-2)
+        # These must be strictly lower than the reference.
+        if K > 1:
+            # Sample K-1 values in [0, 0.40]
+            mu_abnormal = numpyro.sample(
+                "mu_abnormal", dist.Uniform(0.0, 0.40).expand([K - 1])
+            )
+            # Sort them so State 0 is the strongest imbalance (closest to 0)
+            mu_sorted_abnormal = jnp.sort(mu_abnormal)
+            mu = jnp.concatenate([mu_sorted_abnormal, mu_ref[None]])
+        else:
+            # Fallback for K=1
+            mu = mu_ref[None]
         kappa = numpyro.sample(
             "kappa", dist.Gamma(2.0, 0.02).expand([K])
         )  # TODO: evaluate this prior.
