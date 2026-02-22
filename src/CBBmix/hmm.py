@@ -284,8 +284,8 @@ class BaseHMM:
             raw_inc = numpyro.sample("mu_raw_inc", dist.Dirichlet(jnp.ones(K)))
             remaining = 0.5 - mu_base
             cum = mu_base + jnp.cumsum(raw_inc) * remaining
-            # NOTE: dropping 0.5 because reference bias pushes observed BAF below 0.5
-            mu = jnp.concatenate([mu_base[None], cum[:-1]])
+            # NOTE: moved from cum[:-1] to cum
+            mu = jnp.concatenate([mu_base[None], cum])
         else:
             mu = mu_base[None]
         mu = numpyro.deterministic("mu", mu)
