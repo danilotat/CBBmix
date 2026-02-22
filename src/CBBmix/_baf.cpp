@@ -149,8 +149,7 @@ static py::tuple compute_baf(const std::string &bam_path,
     bam_plp_t plp = bam_plp_init(plp_callback, &pdata);
     struct PlpGuard { bam_plp_t p; ~PlpGuard() { if(p) bam_plp_destroy(p); } } plp_guard_obj{plp};
 
-    int tid, n;
-    hts_pos_t pos;
+    int tid, pos, n;
     const bam_pileup1_t *pile;
 
     while ((pile = bam_plp_auto(plp, &tid, &pos, &n)) != nullptr) {
