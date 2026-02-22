@@ -28,6 +28,7 @@ def compute_baf(
     min_baf: float = 0.2,
     max_baf: float = 0.7,
     min_alt: int = 2,
+    strand: str = "",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute B-Allele Frequencies from a BAM file for a genomic region.
 
@@ -51,6 +52,10 @@ def compute_baf(
         Maximum BAF threshold to report (default: 0.7).
     min_alt : int
         Minimum alt allele read count to report (default: 2).
+    strand : str
+        Strand filter. ``"+"`` or ``"forward"`` for forward-strand reads
+        only, ``"-"`` or ``"reverse"`` for reverse-strand reads only,
+        ``""`` (default) for both strands.
 
     Returns
     -------
@@ -69,7 +74,7 @@ def compute_baf(
         )
     return _compute_baf(
         bam_path, ref_path, region, min_depth, min_mapq, min_baseq, min_baf, max_baf,
-        min_alt,
+        min_alt, strand,
     )
 
 
@@ -86,6 +91,7 @@ def compute_baf_genome(
     min_baf: float = 0.2,
     max_baf: float = 0.7,
     min_alt: int = 2,
+    strand: str = "",
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Compute BAF across all chromosomes (or a subset).
 
@@ -109,6 +115,10 @@ def compute_baf_genome(
         Maximum BAF to report (default: 0.7).
     min_alt : int
         Minimum alt allele read count to report (default: 2).
+    strand : str
+        Strand filter. ``"+"`` or ``"forward"`` for forward-strand reads
+        only, ``"-"`` or ``"reverse"`` for reverse-strand reads only,
+        ``""`` (default) for both strands.
 
     Returns
     -------
@@ -122,7 +132,7 @@ def compute_baf_genome(
     for chrom in chromosomes:
         positions, total_depth, alt_depth = compute_baf(
             bam_path, ref_path, chrom, min_depth, min_mapq, min_baseq, min_baf,
-            max_baf, min_alt,
+            max_baf, min_alt, strand,
         )
         results[chrom] = (positions, total_depth, alt_depth)
     return results

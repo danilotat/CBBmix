@@ -10,11 +10,10 @@ from multiprocessing import Pool
 def _worker_baf(args):
     """
     Top-level helper function for multiprocessing.
-    args: (gene_id, chrom, arm, bam_path, ref_path, region_string)
+    args: (gene_id, chrom, arm, bam_path, ref_path, region_string, strand)
     """
-    gid, chrom, arm, bam, ref, region = args
-    # Call the static method logic
-    pos, depths, alts = GeneEntry._get_BAFs(bam, ref, region)
+    gid, chrom, arm, bam, ref, region, strand = args
+    pos, depths, alts = GeneEntry._get_BAFs(bam, ref, region, strand)
     return gid, chrom, arm, (pos, depths, alts)
 
 
@@ -94,16 +93,17 @@ class GTF_record(object):
             return feat_dict
 
 class GeneEntry:
-    def __init__(self, id: str, chrom: str, start: int, end: int):
+    def __init__(self, id: str, chrom: str, start: int, end: int, strand: str = ""):
         self.id = id
         self.chrom = chrom
         self.start = start
         self.end = end
+        self.strand = strand
         self.region = f"{self.chrom}:{self.start}-{self.end}"
 
     @staticmethod
-    def _get_BAFs(bam: str, ref: str, region: str, **kwargs):
-        pos, depths, alts = compute_baf(bam, ref, region)
+    def _get_BAFs(bam: str, ref: str, region: str, strand: str = ""):
+        pos, depths, alts = compute_baf(bam, ref, region, strand=strand)
         return pos, depths, alts
     
 
@@ -112,7 +112,8 @@ class GeneCollector(object):
         self._gtf = gtf
         self._ref = ref
         self._bam = bam
-        self._chrArms = ChromosomeArmLookup(_CHROMOSOME_ARMS)
+        self._chrArms = chromArms
+        self.threads = threads
         self.genes = self._collect_genes()
         self.bafs = self._get_bafs()
     
@@ -126,7 +127,8 @@ class GeneCollector(object):
                     if entry.feature_type == 'gene':
                         gene = GeneEntry(
                             entry.attributes.get('gene_name', None),
-                            entry.chromosome, entry.start, entry.end
+                            entry.chromosome, entry.start, entry.end,
+                            entry.strand,
                         )
                         chromArm = self._chrArms.query(gene.chrom, gene.start)
                         genes[gene.chrom][chromArm].append(gene)
@@ -141,10 +143,8 @@ class GeneCollector(object):
         for chrom, arms in self.genes.items():
             for arm, gene_list in arms.items():
                 for gene in gene_list:
-                    # Construct region string 'chrom:start-end'
                     region = f"{gene.chrom}:{gene.start}-{gene.end}"
-                    # Pack all necessary data into a tuple
-                    task = (gene.id, gene.chrom, arm, self._bam, self._ref, region)
+                    task = (gene.id, gene.chrom, arm, self._bam, self._ref, region, gene.strand)
                     tasks.append(task)
     
         results = []

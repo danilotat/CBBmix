@@ -88,7 +88,18 @@ static py::tuple compute_baf(const std::string &bam_path,
                              int min_baseq   = 20,
                              float min_baf   = 0.2f,
                              float max_baf   = 0.7f,
-                             int min_alt     = 2) {
+                             int min_alt     = 2,
+                             const std::string &strand = "") {
+    // strand filter: 0 = no filter, 1 = forward only, 2 = reverse only
+    int strand_filter = 0;
+    if (strand == "+" || strand == "forward") {
+        strand_filter = 1;
+    } else if (strand == "-" || strand == "reverse") {
+        strand_filter = 2;
+    } else if (!strand.empty()) {
+        throw std::invalid_argument(
+            "strand must be \"+\", \"-\", \"forward\", \"reverse\", or empty; got: " + strand);
+    }
     // Open BAM
     HtsFilePtr fp(sam_open(bam_path.c_str(), "r"));
     if (!fp) throw std::runtime_error("Cannot open BAM: " + bam_path);
@@ -149,6 +160,10 @@ static py::tuple compute_baf(const std::string &bam_path,
             if (pile[i].is_del || pile[i].is_refskip) continue;
             const bam1_t *b = pile[i].b;
             if (static_cast<int>(b->core.qual) < min_mapq) continue;
+
+            // Strand filter: BAM_FREVERSE (0x10) set = reverse strand
+            if (strand_filter == 1 && (b->core.flag & BAM_FREVERSE)) continue;
+            if (strand_filter == 2 && !(b->core.flag & BAM_FREVERSE)) continue;
 
             uint8_t *qual = bam_get_qual(b);
             if (static_cast<int>(qual[pile[i].qpos]) < min_baseq) continue;
@@ -212,6 +227,7 @@ PYBIND11_MODULE(_baf, m) {
           py::arg("min_baf")    = 0.2f,
           py::arg("max_baf")    = 0.7f,
           py::arg("min_alt")    = 2,
+          py::arg("strand")     = "",
           R"doc(
 Compute B-Allele Frequencies from a BAM file for a genomic region.
 
@@ -235,6 +251,10 @@ max_baf : float
     Maximum BAF to report (default: 0.7).
 min_alt : int
     Minimum alt allele read count to report (default: 2).
+strand : str
+    Strand filter. "+" or "forward" for forward-strand reads only,
+    "-" or "reverse" for reverse-strand reads only, "" (default) for
+    both strands.
 
 Returns
 -------
