@@ -276,20 +276,8 @@ class BaseHMM:
             log_pi        : (K,) log initial state distribution
         """
         K = self.n_states
-
-        # Means must satisfy 0 < mu_0 < mu_1 < ... < mu_{K-1} < 0.5.
-        mu_base_raw = numpyro.sample("mu_base_raw", dist.Beta(2.0, 10.0))
-        mu_base = mu_base_raw * 0.45  # scale to [0, 0.45] to leave room for partitioning up to 0.5
-        if K > 1:
-            raw_inc = numpyro.sample("mu_raw_inc", dist.Dirichlet(jnp.ones(K)))
-            remaining = 0.5 - mu_base
-            cum = mu_base + jnp.cumsum(raw_inc) * remaining
-            # NOTE: moved from cum[:-1] to cum
-            mu = jnp.concatenate([mu_base[None], cum])
-        else:
-            mu = mu_base[None]
-        mu = numpyro.deterministic("mu", mu)
-
+        mu_raw = numpyro.sample("mu_raw", dist.Uniform(0.0, 0.5).expand([K]))
+        mu = numpyro.deterministic("mu", jnp.sort(mu_raw))
         kappa = numpyro.sample(
             "kappa", dist.Gamma(2.0, 0.02).expand([K])
         )  # TODO: evaluate this prior.
