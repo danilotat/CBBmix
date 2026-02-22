@@ -8,8 +8,8 @@ import numpyro.distributions as dist
 from dataclasses import dataclass
 from numpyro.infer import MCMC, NUTS, init_to_value
 from typing import Optional, Dict, List, Union
-from .vcf import GermlineVariantCollector
-from .utils import (
+from CBBmix.vcf import GermlineVariantCollector
+from CBBmix.utils import (
     compute_scaled_distances,
     extract_segments_from_posterior,
     prune_and_merge_segments,

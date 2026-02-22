@@ -19,6 +19,7 @@ import numpy as np
 
 
 # emission log-likelihood: Beta-Binomial pmf in log-space, vectorized over (T, K)
+@jax.jit
 def log_beta_binomial(k, n, alpha, beta_param):
     """
     Log-pmf of BetaBinomial(n, alpha, beta) at k. Returns (T, K).
@@ -34,6 +35,7 @@ def log_beta_binomial(k, n, alpha, beta_param):
 
 # transition matrices with distance-dependent interpolation between identity and base matrix
 # using exponential decay: rho_i = exp(-d_i / length_scale)
+@jax.jit
 def make_transition_matrices(log_A_base, distances, length_scale):
     """
     Construct per-interval transition matrices (in log-space) that interpolate
@@ -73,7 +75,7 @@ def make_transition_matrices(log_A_base, distances, length_scale):
     A_eff = rho * jnp.eye(K)[None, :, :] + (1.0 - rho) * A_base[None, :, :]
     return jnp.log(jnp.clip(A_eff, a_min=1e-30)) # clipping to avoid log(0) = -inf issues
 
-
+@jax.jit
 def forward_log_likelihood(log_pi, log_A, log_emit):
     """
     Compute the log marginal likelihood of an observation sequence under a discrete-state HMM
@@ -120,7 +122,7 @@ def forward_log_likelihood(log_pi, log_A, log_emit):
     return jax.nn.logsumexp(log_alpha_T)
 
 
-
+@jax.jit
 def viterbi_decode(log_pi, log_A, log_emit):
     """
     Perform Viterbi decoding (most likely state sequence() for an
@@ -170,7 +172,7 @@ def viterbi_decode(log_pi, log_A, log_emit):
     _, traced = lax.scan(bwd, last, jnp.arange(T - 2, -1, -1))
     return jnp.concatenate([jnp.flip(traced), last[None]])
 
-
+@jax.jit
 def forward_backward(log_pi, log_A, log_emit):
     """
     Compute posterior marginals p(z_t = k | y_{1:T}) for a discrete-state HMM
@@ -240,18 +242,12 @@ def forward_backward(log_pi, log_A, log_emit):
 
 
 @dataclass
-class BetaBinomialHMM:
+class BaseHMM:
     """
-    Beta-Binomial HMM for CNV detection from allele counts.
-    It forces the 
+    Base class for Beta-Binomial HMMs with shared priors, inference, and decoding.
 
     States ordered by increasing minor allele fraction:
         state 0 = strongest LOH, state K-1 = neutral (~0.5)
-
-    Input arrays (all methods):
-        positions : (T,)  genomic bp, sorted
-        depth     : (T,)  total read depth
-        alt_depth : (T,)  alternate allele count
     """
     n_states: int = 3
     length_scale: float = 1_000_000.0  # transition distance decay (bp)
@@ -262,75 +258,48 @@ class BetaBinomialHMM:
     mcmc_: Optional[MCMC] = field(default=None, repr=False)
     posterior_samples_: Optional[dict] = field(default=None, repr=False)
 
-
-    @staticmethod
-    def _prepare_data(positions, depth, alt_depth) -> dict:
+    def _sample_hmm_priors(self):
         """
-        That's the core preprocessing of the model. Given that we don't know the phase of the variants,
-        we could just observe deviations from the expected true diploidity that is assumed to be centered
-        towards 0.5. Doing the folding, we're modeling every site to be comprised in the range of [0, n/2]
-        instead of just [0,n], as the BAF will be pushed towards 0 or 1 according to the phase. In this way, 
-        the model is symmetric.
-        """
-        pos = jnp.asarray(positions, dtype=jnp.float32)
-        dep = jnp.asarray(depth, dtype=jnp.float32)
-        alt = jnp.asarray(alt_depth, dtype=jnp.float32)
-        minor = jnp.minimum(alt, dep - alt)
-        dists = jnp.clip(jnp.diff(pos), a_min=1.0)
-        return {"minor": minor, "depth": dep, "distances": dists}
+        Sample shared HMM priors inside a NumPyro model context.
 
+        Samples:
+        - mu: ordered minor allele fractions via Dirichlet partitioning of [mu_base, 0.5]
+        - kappa: per-state concentration (inverse overdispersion) ~ Gamma
+        - A_base: transition matrix rows ~ Dirichlet (strong diagonal bias)
+        - pi: initial state distribution ~ Dirichlet (neutral preference)
 
-    def _model(self, minor: jnp.ndarray, depth: jnp.ndarray, distances: jnp.ndarray):
+        Returns
+        -------
+        tuple (alpha, beta_p, log_A_base, log_pi)
+            alpha, beta_p : (K,) Beta-Binomial shape parameters
+            log_A_base    : (K, K) log base transition matrix
+            log_pi        : (K,) log initial state distribution
         """
-        Core definition of the HMM model using Beta-Binomial emissions and distance-dependent transitions.
-        The concept here is based on the reparametrization for each state k:
-        - mu_k: expected minor allele fraction for state k, ordered via a Dirichlet partitioning of [mu_base, 0.5]
-        - kappa_k: concentration (inverse overdispersion) for state k, sampled from a Gamma distribution
-        - alpha_k = mu_k * kappa_k
-        - beta_k = (1 - mu_k) * kappa_k 
-
-        - 
-        Generative model with:
-        - Ordered mu via Dirichlet partitioning of [mu_base, 0.5]
-        - Per-state concentration kappa ~ Gamma
-        - Distance-dependent transitions with Dirichlet(strong diagonal) base
-        - Initial state Dirichlet with neutral preference
-        """
-        assert minor.ndim == 1 and depth.ndim == 1 and distances.ndim == 1, "Input arrays must be 1D"
         K = self.n_states
 
-        # Means must satisfy 0 < mu_0 < mu_1 < ... < mu_{K-1} < 0.5. 
-        # sample mu_base_raw < 0.5 
+        # Means must satisfy 0 < mu_0 < mu_1 < ... < mu_{K-1} < 0.5.
         mu_base_raw = numpyro.sample("mu_base_raw", dist.Beta(2.0, 10.0))
-        mu_base = mu_base_raw * 0.45  #scale to [0, 0.45] to leave room for the Dirichlet partitioning up to 0.5. That's just for safety.
+        mu_base = mu_base_raw * 0.45  # scale to [0, 0.45] to leave room for partitioning up to 0.5
         if K > 1:
-            # sample raw increments then scale to fill the gap between mu_base and 0.5
             raw_inc = numpyro.sample("mu_raw_inc", dist.Dirichlet(jnp.ones(K)))
             remaining = 0.5 - mu_base
             cum = mu_base + jnp.cumsum(raw_inc) * remaining
-            # K values: mu_base, then K-2 interior, last ~ 0.5
-            #NOTE: we're dropping 0.5 because we're assuming that the reference bias will always push
-            # the observed BAF below 0.5. 
-            mu = jnp.concatenate([mu_base[None], cum[:-1]])  
+            # NOTE: dropping 0.5 because reference bias pushes observed BAF below 0.5
+            mu = jnp.concatenate([mu_base[None], cum[:-1]])
         else:
-            # fallback for K=1: just use mu_base as the single state's mean
             mu = mu_base[None]
         mu = numpyro.deterministic("mu", mu)
-        # beta binomial overdispersion, to control the spread of the emission distributions around the means.
-        # Higher kappa -> less overdispersion, more concentrated around mu.
+
         kappa = numpyro.sample(
             "kappa", dist.Gamma(2.0, 0.02).expand([K])
-        ) #TODO: evaluate this prior.
+        )  # TODO: evaluate this prior.
         kappa = numpyro.deterministic("kappa_det", kappa)
-        # clip to prevent numerical issues in the Beta-Binomial likelihood when alpha or beta are too small. 
-        # NOTE: here the clipping is just for the lower bound, but could be evaluated if an upper bound is needed as well
 
         alpha = jnp.clip(mu * kappa, a_min=1e-4)
         beta_p = jnp.clip((1.0 - mu) * kappa, a_min=1e-4)
 
-        # Base diagonal matrix construction.
-        # 100 on the diagonal, 1 off-diagonal, to encourage self-transitions.
-        diag_c, off_c = 100.0, 1.0 #TODO: evaluate this prior, as it may be too strong.
+        # Base diagonal matrix: 100 on diagonal, 1 off-diagonal
+        diag_c, off_c = 100.0, 1.0  # TODO: evaluate this prior, as it may be too strong.
         A_conc = jnp.full((K, K), off_c).at[
             jnp.diag_indices(K)
         ].set(diag_c)
@@ -342,13 +311,87 @@ class BetaBinomialHMM:
         A_base = jnp.stack(A_rows)
         log_A_base = jnp.log(jnp.clip(A_base, a_min=1e-30))
 
-        # Initial state: 5x preference on the neutral state (last one).
+        # Initial state: 5x preference on the neutral state (last one)
         pi_conc = jnp.ones(K).at[-1].set(5.0)
         pi = numpyro.sample("pi", dist.Dirichlet(pi_conc))
         log_pi = jnp.log(jnp.clip(pi, a_min=1e-30))
 
-        # This trick is to avoid enumerating all the states, so with the fw 
-        # we could compute the marginal likelihood over all the hidden state sequences.
+        return alpha, beta_p, log_A_base, log_pi
+
+    def _get_posterior_mean_params(self):
+        """
+        Compute posterior-mean estimates of HMM parameters from stored posterior samples.
+
+        Returns
+        -------
+        tuple (mu, kappa, A, pi)
+            mu    : (K,)    posterior mean emission locations
+            kappa : (K,)    posterior mean concentrations
+            A     : (K, K)  posterior mean transition matrix
+            pi    : (K,)    posterior mean initial state distribution
+        """
+        s = self.posterior_samples_
+        mu = jnp.mean(s["mu"], axis=0)
+        kappa = jnp.mean(s["kappa_det"], axis=0)
+        A_rows = [jnp.mean(s[f"A_row_{i}"], axis=0)
+                  for i in range(self.n_states)]
+        return mu, kappa, jnp.stack(A_rows), jnp.mean(s["pi"], axis=0)
+
+    def _get_emission_params(self):
+        """
+        Compute alpha, beta_p, log_A_base, log_pi from posterior means.
+
+        Returns
+        -------
+        tuple (alpha, beta_p, log_A_base, log_pi)
+        """
+        mu, kappa, A_base, pi = self._get_posterior_mean_params()
+        alpha = jnp.clip(mu * kappa, a_min=1e-4)
+        beta_p = jnp.clip((1.0 - mu) * kappa, a_min=1e-4)
+        log_A_base = jnp.log(jnp.clip(A_base, a_min=1e-30))
+        log_pi = jnp.log(jnp.clip(pi, a_min=1e-30))
+        return alpha, beta_p, log_A_base, log_pi
+
+    def summary(self):
+        if self.mcmc_ is None:
+            raise RuntimeError("Call .fit() first")
+        self.mcmc_.print_summary()
+
+    def get_posterior_params(self):
+        """Dict of posterior means: mu, kappa, A, pi."""
+        mu, kappa, A, pi = self._get_posterior_mean_params()
+        return {"mu": np.asarray(mu), "kappa": np.asarray(kappa),
+                "A": np.asarray(A), "pi": np.asarray(pi)}
+
+
+@dataclass
+class BetaBinomialHMM(BaseHMM):
+    """
+    Beta-Binomial HMM for CNV detection from allele counts.
+    Operates at SNP resolution: each site is one HMM time step.
+
+    Input arrays (all methods):
+        positions : (T,)  genomic bp, sorted
+        depth     : (T,)  total read depth
+        alt_depth : (T,)  alternate allele count
+    """
+
+    @staticmethod
+    def _prepare_data(positions, depth, alt_depth) -> dict:
+        """
+        Fold BAF to minor allele counts [0, n/2] for phase-agnostic modeling.
+        """
+        pos = jnp.asarray(positions, dtype=jnp.float32)
+        dep = jnp.asarray(depth, dtype=jnp.float32)
+        alt = jnp.asarray(alt_depth, dtype=jnp.float32)
+        minor = jnp.minimum(alt, dep - alt)
+        dists = jnp.clip(jnp.diff(pos), a_min=1.0)
+        return {"minor": minor, "depth": dep, "distances": dists}
+
+    def _model(self, minor, depth, distances):
+        """NumPyro generative model: SNP-level Beta-Binomial emissions."""
+        alpha, beta_p, log_A_base, log_pi = self._sample_hmm_priors()
+
         log_emit = log_beta_binomial(minor, depth, alpha, beta_p)
         log_A = make_transition_matrices(
             log_A_base, distances, self.length_scale
@@ -358,11 +401,8 @@ class BetaBinomialHMM:
             forward_log_likelihood(log_pi, log_A, log_emit)
         )
 
-    
     def fit(self, positions, depth, alt_depth, **kwargs):
-        """
-        Core NUTS inference method. The input arrays must be sorted by position.
-        """
+        """Run NUTS inference. Input arrays must be sorted by position."""
         data = self._prepare_data(positions, depth, alt_depth)
         kernel = NUTS(
             self._model, max_tree_depth=10, target_accept_prob=0.8, **kwargs
@@ -378,55 +418,15 @@ class BetaBinomialHMM:
         self.posterior_samples_ = self.mcmc_.get_samples()
         return self
 
-
-    def _get_posterior_mean_params(self):
-        """
-        Compute posterior-mean estimates of HMM parameters from stored posterior samples.
-
-        This method reads posterior samples from self.posterior_samples_ and returns the
-        posterior mean of the model parameters. The means are computed by averaging
-        over the sample axis (axis=0) for each stored parameter.
-
-        Returns
-        -------
-        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
-            A 4-tuple containing:
-            - mu: Posterior mean of the emission/location parameters. This has the same
-              shape as a single sample of self.posterior_samples_["mu"] (i.e. the sample
-              axis removed).
-            - kappa: Posterior mean of the concentration/deterministic kappa
-              parameters. Shape matches a single sample of self.posterior_samples_["kappa_det"].
-            - A: Posterior mean state transition matrix, constructed by averaging each
-              stored row "A_row_{i}" across samples and stacking them in order. Shape
-              is (n_states, n_states).
-            - pi: Posterior mean of the initial state distribution. Shape matches a
-              single sample of self.posterior_samples_["pi"] (typically (n_states,)).
-        """
-        s = self.posterior_samples_
-        # just the mean of posterior samples for each parameter. Note that this is not the best
-        # given that we're computing a full posterior, but a single point estimation 
-        # may keep things simpler for the decoding.
-        mu = jnp.mean(s["mu"], axis=0)
-        kappa = jnp.mean(s["kappa_det"], axis=0)
-        A_rows = [jnp.mean(s[f"A_row_{i}"], axis=0)
-                  for i in range(self.n_states)]
-        return mu, kappa, jnp.stack(A_rows), jnp.mean(s["pi"], axis=0)
-
     def _build_log_params(self, data):
-        mu, kappa, A_base, pi = self._get_posterior_mean_params()
-        alpha = jnp.clip(mu * kappa, a_min=1e-4)
-        beta_p = jnp.clip((1.0 - mu) * kappa, a_min=1e-4)
+        alpha, beta_p, log_A_base, log_pi = self._get_emission_params()
         log_emit = log_beta_binomial(
             data["minor"], data["depth"], alpha, beta_p
         )
         log_A = make_transition_matrices(
-            jnp.log(jnp.clip(A_base, a_min=1e-30)),
-            data["distances"], self.length_scale
+            log_A_base, data["distances"], self.length_scale
         )
-        log_pi = jnp.log(jnp.clip(pi, a_min=1e-30))
         return log_pi, log_A, log_emit
-
-    # -- decode --------------------------------------------------------------
 
     def decode(self, positions, depth, alt_depth, method="viterbi"):
         """
@@ -452,13 +452,126 @@ class BetaBinomialHMM:
         log_pi, log_A, log_emit = self._build_log_params(data)
         return np.asarray(forward_backward(log_pi, log_A, log_emit))
 
-    def summary(self):
-        if self.mcmc_ is None:
-            raise RuntimeError("Call .fit() first")
-        self.mcmc_.print_summary()
 
-    def get_posterior_params(self):
-        """Dict of posterior means: mu, kappa, A, pi."""
-        mu, kappa, A, pi = self._get_posterior_mean_params()
-        return {"mu": np.asarray(mu), "kappa": np.asarray(kappa),
-                "A": np.asarray(A), "pi": np.asarray(pi)}
+@dataclass
+class GeneClusteredHMM(BaseHMM):
+    """
+    Beta-Binomial HMM where emissions are aggregated at the Gene level.
+
+    SNP-level log-likelihoods are summed per gene via segment_sum, so the
+    HMM trellis operates over genes (not SNPs). Transitions use inter-gene
+    distances.
+
+    Extra inputs (beyond positions/depth/alt_depth):
+        gene_indices : (N_snps,) int mapping each SNP to gene 0..G-1
+        gene_centers : (G,)     genomic position per gene (for transition distances)
+    """
+
+    @staticmethod
+    def _prepare_data(positions, depth, alt_depth, gene_indices, gene_centers) -> dict:
+        """
+        Fold BAF to minor allele, compute inter-gene distances.
+
+        Parameters
+        ----------
+        gene_indices : int array (N_snps,) mapping SNP to gene 0..G-1
+        gene_centers : float array (G,) genomic position per gene
+        """
+        dep = jnp.asarray(depth, dtype=jnp.float32)
+        alt = jnp.asarray(alt_depth, dtype=jnp.float32)
+        minor = jnp.minimum(alt, dep - alt)
+
+        g_idx = jnp.asarray(gene_indices, dtype=jnp.int32)
+        g_pos = jnp.asarray(gene_centers, dtype=jnp.float32)
+        dists = jnp.clip(jnp.diff(g_pos), a_min=1.0)
+
+        return {
+            "minor": minor,
+            "depth": dep,
+            "distances": dists,
+            "gene_indices": g_idx,
+            "n_genes": g_pos.shape[0],
+        }
+
+    def _model(self, minor, depth, distances, gene_indices, n_genes):
+        """NumPyro generative model: gene-aggregated Beta-Binomial emissions."""
+        alpha, beta_p, log_A_base, log_pi = self._sample_hmm_priors()
+
+        # SNP-level log-likelihoods: (N_snps, K)
+        log_emit_snps = log_beta_binomial(minor, depth, alpha, beta_p)
+
+        # Aggregate to genes: log P(Gene | State) = sum_i log P(SNP_i | State)
+        log_emit_genes = jax.ops.segment_sum(
+            log_emit_snps, gene_indices, num_segments=n_genes
+        )
+
+        log_A = make_transition_matrices(
+            log_A_base, distances, self.length_scale
+        )
+        numpyro.factor(
+            "obs_log_lik",
+            forward_log_likelihood(log_pi, log_A, log_emit_genes)
+        )
+
+    def fit(self, positions, depth, alt_depth, gene_indices, gene_centers, **kwargs):
+        """Run NUTS inference with gene-level aggregation."""
+        data = self._prepare_data(
+            positions, depth, alt_depth, gene_indices, gene_centers
+        )
+        kernel = NUTS(
+            self._model, max_tree_depth=10, target_accept_prob=0.8, **kwargs
+        )
+        self.mcmc_ = MCMC(
+            kernel,
+            num_warmup=self.num_warmup,
+            num_samples=self.num_samples,
+            num_chains=self.num_chains,
+            progress_bar=True,
+        )
+        self.mcmc_.run(jax.random.PRNGKey(self.seed), **data)
+        self.posterior_samples_ = self.mcmc_.get_samples()
+        return self
+
+    def _build_log_params(self, data):
+        alpha, beta_p, log_A_base, log_pi = self._get_emission_params()
+
+        log_emit_snps = log_beta_binomial(
+            data["minor"], data["depth"], alpha, beta_p
+        )
+        log_emit_genes = jax.ops.segment_sum(
+            log_emit_snps, data["gene_indices"], num_segments=data["n_genes"]
+        )
+        log_A = make_transition_matrices(
+            log_A_base, data["distances"], self.length_scale
+        )
+        return log_pi, log_A, log_emit_genes
+
+    def decode(self, positions, depth, alt_depth, gene_indices, gene_centers,
+               method="viterbi"):
+        """
+        Decode per-gene states.
+        Returns (N_genes,) int. Map back to SNPs via gene_states[gene_indices].
+        """
+        if self.posterior_samples_ is None:
+            raise RuntimeError("Call .fit() first")
+        data = self._prepare_data(
+            positions, depth, alt_depth, gene_indices, gene_centers
+        )
+        log_pi, log_A, log_emit = self._build_log_params(data)
+        if method == "viterbi":
+            return np.asarray(viterbi_decode(log_pi, log_A, log_emit))
+        elif method == "posterior":
+            gamma = forward_backward(log_pi, log_A, log_emit)
+            return np.asarray(jnp.argmax(gamma, axis=1))
+        raise ValueError(f"Unknown method: {method}")
+
+    def posterior_marginals(self, positions, depth, alt_depth, gene_indices,
+                           gene_centers):
+        """(N_genes, K) posterior p(z_g=k | data)."""
+        if self.posterior_samples_ is None:
+            raise RuntimeError("Call .fit() first")
+        data = self._prepare_data(
+            positions, depth, alt_depth, gene_indices, gene_centers
+        )
+        log_pi, log_A, log_emit = self._build_log_params(data)
+        return np.asarray(forward_backward(log_pi, log_A, log_emit))

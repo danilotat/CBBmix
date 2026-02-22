@@ -68,6 +68,8 @@ from .plotting import (
     VariantHandler,
     BAFPlotter,
 )
+from .hmm import BetaBinomialHMM, GeneClusteredHMM
+from .genepool import GeneCollector, GeneEntry
 from .baf import compute_baf, compute_baf_genome, HAS_BAF_EXTENSION
 
 __version__ = "0.1.0"
@@ -83,6 +85,12 @@ __all__ = [
     # Somatic model
     "SomaticModel",
     "SomaticPriorConfig",
+    # HMM models
+    "BetaBinomialHMM",
+    "GeneClusteredHMM",
+    # Gene pooling
+    "GeneCollector",
+    "GeneEntry",
     # Segmentation utilities
     "SegmentLookup",
     "SegmentInfo",
