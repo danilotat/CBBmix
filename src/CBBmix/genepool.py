@@ -85,18 +85,12 @@ class GTF_record(object):
             return attributes
         else:
             feat_dict = {}
-            keyVal = attributes.split(";")[:-1]
-            for item in keyVal:
-                replItem = item.replace(' "', '="')
-                # populate the dict
-                try:
-                    k, v = replItem.split("=")
-                    rk = k.replace(" ", "")
-                    vk = v.replace('"', "")
-                    feat_dict[rk] = vk
-                except ValueError:
-                    print(f"Unable to parse this attribute field\n{attributes}")
-                    exit()
+            for item in attributes.split(";"):
+                item = item.strip()
+                if not item:
+                    continue
+                key, _, value = item.partition(" ")
+                feat_dict[key] = value.strip('"')
             return feat_dict
 
 class GeneEntry:
