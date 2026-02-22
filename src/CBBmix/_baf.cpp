@@ -86,22 +86,25 @@ static py::tuple compute_baf(const std::string &bam_path,
         else throw std::invalid_argument("Invalid strand arg");
     }
 
-    HtsFilePtr fp(sam_open(bam_path.c_str(), "r"));
-    if (!fp) throw std::runtime_error("Cannot open BAM");
-
-    // Thread pool setup
-    hts_tpool *p = nullptr;
-    if (n_threads > 1) {
-        p = hts_tpool_init(n_threads);
-        if (p) {
-            htsThreadPool tp = {p, 0};
-            hts_set_thread_pool(fp.get(), &tp);
-        }
-    }
+    // Thread pool must outlive the file handle (destroyed after sam_close).
+    // Declare guard first so it is destroyed last.
+    hts_tpool *tpool_raw = nullptr;
     struct PoolGuard {
         hts_tpool *p;
         ~PoolGuard() { if (p) hts_tpool_destroy(p); }
-    } pool_guard{p};
+    } pool_guard{nullptr};
+
+    HtsFilePtr fp(sam_open(bam_path.c_str(), "r"));
+    if (!fp) throw std::runtime_error("Cannot open BAM");
+
+    if (n_threads > 1) {
+        tpool_raw = hts_tpool_init(n_threads);
+        if (tpool_raw) {
+            pool_guard.p = tpool_raw;
+            htsThreadPool tp = {tpool_raw, 0};
+            hts_set_thread_pool(fp.get(), &tp);
+        }
+    }
 
     HdrPtr hdr(sam_hdr_read(fp.get()));
     if (!hdr) throw std::runtime_error("Cannot read header");
@@ -147,7 +150,7 @@ static py::tuple compute_baf(const std::string &bam_path,
     struct PlpGuard { bam_plp_t p; ~PlpGuard() { if(p) bam_plp_destroy(p); } } plp_guard_obj{plp};
 
     int tid, n;
-    int pos; // FIXED: bam_plp_auto expects `int*` in this version of htslib
+    hts_pos_t pos;
     const bam_pileup1_t *pile;
 
     while ((pile = bam_plp_auto(plp, &tid, &pos, &n)) != nullptr) {
