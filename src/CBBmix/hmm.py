@@ -287,7 +287,9 @@ class BaseHMM:
             )
             # Sort them so State 0 is the strongest imbalance (closest to 0)
             mu_sorted_abnormal = jnp.sort(mu_abnormal)
-            mu = jnp.concatenate([mu_sorted_abnormal, mu_ref[None]])
+            mu_combined = jnp.concatenate([mu_sorted_abnormal, mu_ref[None]])
+            mu = numpyro.deterministic("mu", mu_combined)
+
         else:
             # Fallback for K=1
             mu = mu_ref[None]
