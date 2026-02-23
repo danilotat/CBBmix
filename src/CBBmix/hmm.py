@@ -289,18 +289,28 @@ class BaseHMM:
         # Sample Abnormal Means (States 0..K-2)
         # These must be strictly lower than the reference.
         if K > 1:
-            # Sample K-1 values in [0, 0.40]
-            mu_abnormal = numpyro.sample(
-                "mu_abnormal", dist.Uniform(0.0, 0.40).expand([K - 1])
+            # Dirichlet based method to enforce state separations without hardcoding 
+            # strict priors. 
+            segments = numpyro.sample(
+                "mu_segments", dist.Dirichlet(jnp.ones(K))
             )
-            # Sort them so State 0 is the strongest imbalance (closest to 0)
-            mu_sorted_abnormal = jnp.sort(mu_abnormal)
-            mu_combined = jnp.concatenate([mu_sorted_abnormal, mu_ref[None]])
-            mu = numpyro.deterministic("mu", mu_combined)
+            relative_positions = jnp.cumsum(segments)[:K-1]
+            mu_abnormal = relative_positions * mu_ref
+            mu_combined = jnp.concatenate([mu_abnormal, mu_ref[None]])
+
+
+            # # Sample K-1 values in [0, 0.40]
+            # mu_abnormal = numpyro.sample(
+            #     "mu_abnormal", dist.Uniform(0.0, 0.40).expand([K - 1])
+            # )
+            # # Sort them so State 0 is the strongest imbalance (closest to 0)
+            # mu_sorted_abnormal = jnp.sort(mu_abnormal)
+            # mu_combined = jnp.concatenate([mu_sorted_abnormal, mu_ref[None]])
 
         else:
             # Fallback for K=1
             mu = mu_ref[None]
+        mu = numpyro.deterministic("mu", mu_combined)
         kappa = numpyro.sample(
             "kappa", dist.Gamma(2.0, 0.02).expand([K])
         )  # TODO: evaluate this prior.
