@@ -302,7 +302,6 @@ class BaseHMM:
 
         mu_abnormal = jnp.stack(mu_parts)                                    # (K-1,)
         mu = numpyro.deterministic("mu", jnp.append(mu_abnormal, mu_ref))   # (K,)
-        mu_ref = numpyro.sample("mu_ref", dist.Uniform(0.40, 0.50))
         # # Sample Abnormal Means (States 0..K-2)
         # # These must be strictly lower than the reference.
         # if K > 1:
@@ -508,8 +507,8 @@ class GeneClusteredHMM(BaseHMM):
         """
         dep = jnp.asarray(depth, dtype=jnp.float32)
         alt = jnp.asarray(alt_depth, dtype=jnp.float32)
-        minor = jnp.minimum(alt, dep - alt)
-
+        # drop clipping here
+        minor = alt
         g_idx = jnp.asarray(gene_indices, dtype=jnp.int32)
         g_pos = jnp.asarray(gene_centers, dtype=jnp.float32)
         dists = jnp.clip(jnp.diff(g_pos), a_min=1.0)
