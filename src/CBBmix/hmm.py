@@ -25,6 +25,8 @@ def log_beta_binomial(k, n, alpha, beta_param):
     Log-pmf of BetaBinomial(n, alpha, beta) at k. Returns (T, K).
 
     Uses: log P(k|n,a,b) = log C(n,k) + betaln(k+a, n-k+b) - betaln(a,b)
+    #NOTE: update 23/02: no folding, symmetric likelihood
+
     """
     k_ = k[:, None]
     n_ = n[:, None]
@@ -32,6 +34,12 @@ def log_beta_binomial(k, n, alpha, beta_param):
     b_ = beta_param[None, :]
     log_comb = gammaln(n_ + 1) - gammaln(k_ + 1) - gammaln(n_ - k_ + 1)
     return log_comb + betaln(k_ + a_, n_ - k_ + b_) - betaln(a_, b_)
+
+@jax.jit
+def log_beta_binomial_mixture(k, n, alpha, beta_params):
+    lp_A = log_beta_binomial(k, n, alpha, beta_params) # mode < 0.5
+    lp_B = log_beta_binomial(k, n, beta_params, alpha) #swapping alpha, beta is equal to assuming mode > 0.5
+    return jax.nn.logsumexp(jnp.stack([lp_A, lp_B], axis=0) - jnp.log2(2))
 
 # transition matrices with distance-dependent interpolation between identity and base matrix
 # using exponential decay: rho_i = exp(-d_i / length_scale)
@@ -383,11 +391,13 @@ class BetaBinomialHMM(BaseHMM):
     def _prepare_data(positions, depth, alt_depth) -> dict:
         """
         Fold BAF to minor allele counts [0, n/2] for phase-agnostic modeling.
+        NOTE: update 23/02, no more folding
         """
         pos = jnp.asarray(positions, dtype=jnp.float32)
         dep = jnp.asarray(depth, dtype=jnp.float32)
         alt = jnp.asarray(alt_depth, dtype=jnp.float32)
-        minor = jnp.minimum(alt, dep - alt)
+        minor = alt
+        #minor = jnp.minimum(alt, dep - alt)
         dists = jnp.clip(jnp.diff(pos), a_min=1.0)
         return {"minor": minor, "depth": dep, "distances": dists}
 
@@ -501,7 +511,10 @@ class GeneClusteredHMM(BaseHMM):
         alpha, beta_p, log_A_base, log_pi = self._sample_hmm_priors()
 
         # SNP-level log-likelihoods: (N_snps, K)
-        log_emit_snps = log_beta_binomial(minor, depth, alpha, beta_p)
+        # NOTE: update 23/02, no folding, symmetric mixture of bb
+        # log_emit_snps = log_beta_binomial(minor, depth, alpha, beta_p)
+        log_emit_snps = log_beta_binomial_mixture(minor, depth, alpha, beta_p)
+
 
         # Aggregate to genes: log P(Gene | State) = sum_i log P(SNP_i | State)
         log_emit_genes = jax.ops.segment_sum(
