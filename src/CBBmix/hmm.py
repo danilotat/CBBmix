@@ -284,23 +284,39 @@ class BaseHMM:
             log_pi        : (K,) log initial state distribution
         """
         K = self.n_states
+        # ref state is 0.5 - ref_bias basically.
         mu_ref = numpyro.sample("mu_ref", dist.Uniform(0.40, 0.50))
-        
-        # Sample Abnormal Means (States 0..K-2)
-        # These must be strictly lower than the reference.
-        if K > 1:
-            # Sample K-1 values in [0, 0.40]
-            mu_abnormal = numpyro.sample(
-                "mu_abnormal", dist.Uniform(0.0, 0.40).expand([K - 1])
-            )
-            # Sort them so State 0 is the strongest imbalance (closest to 0)
-            mu_sorted_abnormal = jnp.sort(mu_abnormal)
-            mu_combined = jnp.concatenate([mu_sorted_abnormal, mu_ref[None]])
-            mu = numpyro.deterministic("mu", mu_combined)
 
-        else:
-            # Fallback for K=1
-            mu = mu_ref[None]
+        # enforced states. #NOTE: this is so hardcoded to just 3 states :'(
+        state_bounds = [
+            (0.00, 0.25),  # State 0 – Strong LOH
+            (0.26, 0.48),  # State 1 – Weak LOH
+        ]
+        assert K - 1 <= len(state_bounds), f"Define bounds for all {K-1} abnormal states."
+
+        mu_parts = []
+        for i in range(K - 1):
+            lo, hi = state_bounds[i]
+            mu_i = numpyro.sample(f"mu_{i}", dist.Uniform(lo, hi))
+            mu_parts.append(mu_i)
+
+        mu_abnormal = jnp.stack(mu_parts)                                    # (K-1,)
+        mu = numpyro.deterministic("mu", jnp.append(mu_abnormal, mu_ref))   # (K,)
+        mu_ref = numpyro.sample("mu_ref", dist.Uniform(0.40, 0.50))
+        # # Sample Abnormal Means (States 0..K-2)
+        # # These must be strictly lower than the reference.
+        # if K > 1:
+        #     # Sample K-1 values in [0, 0.40]
+        #     mu_abnormal = numpyro.sample(
+        #         "mu_abnormal", dist.Uniform(0.0, 0.40).expand([K - 1])
+        #     )
+        #     # Sort them so State 0 is the strongest imbalance (closest to 0)
+        #     mu_sorted_abnormal = jnp.sort(mu_abnormal)
+        #     mu_combined = jnp.concatenate([mu_sorted_abnormal, mu_ref[None]])
+        #     mu = numpyro.deterministic("mu", mu_combined)
+        # else:
+        #     # Fallback for K=1
+        #     mu = mu_ref[None]
         kappa = numpyro.sample(
             "kappa", dist.Gamma(2.0, 0.02).expand([K])
         )  # TODO: evaluate this prior.
